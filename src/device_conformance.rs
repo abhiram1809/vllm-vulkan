@@ -969,3 +969,146 @@ fn batch_snapshot_copies_are_visible_to_host() {
         assert_eq!(&bytes[4 + expected.len()..], &[0xa5; 4]);
     }
 }
+
+/// Wrong-format resident buffers must never reach an F16 GEMM; plain F16 still does.
+#[cfg(feature = "gemma")]
+#[test]
+fn gemm_format_guards_preserve_cpu_results_and_plain_f16_dispatch() {
+    let Some((engine, _fp16, _sg, _alignment)) =
+        engine_or_skip_with_caps(|caps| caps.shader_float16 = false)
+    else { return };
+    if !engine.has_pipeline("matmul_f16_f32_fp32") { return; }
+    let mut m = crate::batched_forward_tests::tiny_qwen_model();
+    m.engine = Some(engine);
+    let (t, k, n) = (2, 128, 16);
+    let name = "format_guard.weight";
+    let weights = vec![0.125; n * k];
+    let input: Vec<f32> = (0..t * k).map(|i| (i % 17) as f32 * 0.125).collect();
+    m.qwen.as_mut().unwrap().weights.tensors.insert(name.into(), model::SimpleTensor {
+        data: weights.clone(), shape: vec![n, k],
+    });
+    let expected = model::cpu_matmul(&input, &weights, t, k, n);
+    for format in [crate::QuantFormat::Q4_0, crate::QuantFormat::Q4_K,
+        crate::QuantFormat::Q8_0, crate::QuantFormat::Bf16, crate::QuantFormat::F32,
+        crate::QuantFormat::Mlx4, crate::QuantFormat::Nvfp4, crate::QuantFormat::Fp8] {
+        // Padding makes an accidental F16 bind safe to execute, but its NaN
+        // payload cannot produce the finite CPU answer.
+        let buffer = m.engine.as_mut().unwrap().alloc_host_coherent_storage((n * k * 2) as u64).unwrap();
+        buffer.write(&vec![0xff; n * k * 2]).unwrap();
+        m.gpu_weights.insert(name.into(), crate::GpuWeight { buffer, format, aux: None });
+        assert_eq!(m.gpu_gemm(name, &input, t, k, n), expected, "{format:?}");
+    }
+    let engine = m.engine.as_mut().unwrap();
+    let buffer = engine.alloc_host_coherent_storage((n * k * 2) as u64).unwrap();
+    buffer.write(&vec![0xff; n * k * 2]).unwrap();
+    let scale = engine.alloc_host_coherent_storage(4).unwrap();
+    scale.write(&1.0f32.to_le_bytes()).unwrap();
+    m.gpu_weights.insert(name.into(), crate::GpuWeight {
+        buffer, format: crate::QuantFormat::F16,
+        aux: Some(crate::QuantAux::Fp8 { scale, per_row: false }),
+    });
+    assert_eq!(m.gpu_gemm(name, &input, t, k, n), expected, "F16 with auxiliary metadata");
+    let resident = vec![0.25; n * k];
+    let bytes: Vec<u8> = resident.iter().flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes()).collect();
+    let buffer = m.engine.as_mut().unwrap().alloc_host_coherent_storage(bytes.len() as u64).unwrap();
+    buffer.write(&bytes).unwrap();
+    m.gpu_weights.insert(name.into(), crate::GpuWeight { buffer, format: crate::QuantFormat::F16, aux: None });
+    let gpu_expected = model::cpu_matmul(&input, &resident, t, k, n);
+    assert_ne!(gpu_expected, expected);
+    assert_eq!(m.gpu_gemm(name, &input, t, k, n), gpu_expected);
+}
+
+/// Any incompatible gate/up/down weight must prevent the fused F16 FFN dispatch.
+#[cfg(feature = "gemma")]
+#[test]
+fn fused_ffn_format_guard_checks_each_weight() {
+    let Some((engine, _fp16, _sg, _alignment)) =
+        engine_or_skip_with_caps(|caps| caps.shader_float16 = false)
+    else { return };
+    let mut m = crate::batched_forward_tests::tiny_qwen_model();
+    m.engine = Some(engine);
+    let (t, h, inter) = (2, 32, 32);
+    let names = ["guard.gate", "guard.up", "guard.down"];
+    let weights: Vec<f32> = (0..h * inter).map(|i| ((i % 7) as i32 - 3) as f32 * 0.015625).collect();
+    for name in names {
+        m.qwen.as_mut().unwrap().weights.tensors.insert(name.into(), model::SimpleTensor {
+            data: weights.clone(), shape: vec![h, inter],
+        });
+    }
+    let input: Vec<f32> = (0..t * h).map(|i| (i % 13) as f32 * 0.03125).collect();
+    let gate = model::cpu_matmul(&input, &weights, t, h, inter);
+    let act = model::cpu_silu(&gate);
+    let mid: Vec<f32> = act.iter().zip(&gate).map(|(a, u)| a * u).collect();
+    let expected = model::cpu_matmul(&mid, &weights, t, inter, h);
+    let f16: Vec<u8> = weights.iter().flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes()).collect();
+    let poison = vec![0xff; f16.len()];
+    for format in [crate::QuantFormat::Q4_0, crate::QuantFormat::Q4_K,
+        crate::QuantFormat::Q8_0, crate::QuantFormat::Bf16, crate::QuantFormat::F32] {
+        for incompatible in 0..3 {
+            for (slot, name) in names.iter().enumerate() {
+                let buffer = m.engine.as_mut().unwrap().alloc_host_coherent_storage(f16.len() as u64).unwrap();
+                buffer.write(if slot == incompatible { &poison } else { &f16 }).unwrap();
+                m.gpu_weights.insert((*name).into(), crate::GpuWeight {
+                    buffer, format: if slot == incompatible { format } else { crate::QuantFormat::F16 }, aux: None,
+                });
+            }
+            assert_eq!(m.qwen_ffn_gpu(&input, names[0], names[1], names[2], t, h, inter),
+                expected, "{format:?} at slot {incompatible}");
+        }
+    }
+}
+
+/// Lean-host models must still decode resident Q4/Q8/BF16/F32 weights correctly.
+#[cfg(feature = "gemma")]
+#[test]
+fn gemm_format_fallback_handles_lean_host_weights() {
+    let Some((engine, _fp16, _sg, _alignment)) = engine_or_skip() else { return };
+    let mut m = crate::batched_forward_tests::tiny_qwen_model();
+    m.engine = Some(engine);
+    let (t, k, n) = (2, 256, 16);
+    let name = "lean_guard.weight";
+    let weights: Vec<f32> = (0..n * k).map(|i| ((i % 19) as i32 - 9) as f32 * 0.03125).collect();
+    let input: Vec<f32> = (0..t * k).map(|i| ((i % 17) as i32 - 8) as f32 * 0.0625).collect();
+    for format in [crate::QuantFormat::Q4_0, crate::QuantFormat::Q4_K,
+        crate::QuantFormat::Q8_0, crate::QuantFormat::Bf16, crate::QuantFormat::F32] {
+        let (bytes, decoded) = match format {
+            crate::QuantFormat::Q4_0 => { let b = model::quantize_q4_0(&weights); let d = model::dequant_q4_0_to_f32(&b); (b, d) },
+            crate::QuantFormat::Q4_K => { let b = model::quantize_q4_k(&weights); let d = model::dequant_q4_k_to_f32(&b); (b, d) },
+            crate::QuantFormat::Q8_0 => { let b = model::quantize_q8_0(&weights); let d = model::dequant_q8_0_to_f32(&b); (b, d) },
+            crate::QuantFormat::Bf16 => {
+                let d: Vec<f32> = weights.iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect();
+                let b = d.iter().flat_map(|&v| half::bf16::from_f32(v).to_bits().to_le_bytes()).collect();
+                (b, d)
+            },
+            _ => (f32_bytes(&weights), weights.clone()),
+        };
+        let buffer = m.engine.as_mut().unwrap().alloc_host_coherent_storage(bytes.len() as u64).unwrap();
+        buffer.write(&bytes).unwrap();
+        m.gpu_weights.insert(name.into(), crate::GpuWeight { buffer, format, aux: None });
+        assert!(!m.qwen.as_ref().unwrap().weights.contains(name));
+        let actual = m.gpu_gemm(name, &input, t, k, n);
+        let expected = model::cpu_matmul(&input, &decoded, t, k, n);
+        for (i, (&a, &e)) in actual.iter().zip(&expected).enumerate() {
+            assert!((a - e).abs() <= 1e-5 * (1.0 + e.abs()), "{format:?} output {i}: {a} vs {e}");
+        }
+        assert_eq!(actual.len(), expected.len());
+    }
+}
+
+/// F32 residency must use the format-aware Qwen3.5 route instead of an F16 GEMM.
+#[cfg(feature = "qwen35")]
+#[test]
+fn qwen35_gemm_f32_residency_is_format_aware() {
+    let Some((engine, _fp16, _sg, _alignment)) = engine_or_skip() else { return };
+    let mut m = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
+    m.engine = Some(engine);
+    let (t, k, n) = (2, 128, 16);
+    let name = "f32_guard.weight";
+    let weights: Vec<f32> = (0..n).flat_map(|r| std::iter::repeat_n(r as f32 * 0.125, k)).collect();
+    let input: Vec<f32> = (0..t * k).map(|i| (i % 17) as f32 * 0.125).collect();
+    let bytes = f32_bytes(&weights);
+    let buffer = m.engine.as_mut().unwrap().alloc_host_coherent_storage(bytes.len() as u64).unwrap();
+    buffer.write(&bytes).unwrap();
+    m.gpu_weights.insert(name.into(), crate::GpuWeight { buffer, format: crate::QuantFormat::F32, aux: None });
+    assert_eq!(m.qwen35_gemm(name, &input, t, k, n), model::cpu_matmul(&input, &weights, t, k, n));
+}

@@ -7,9 +7,8 @@ use crate::compute;
 use crate::model;
 use crate::VulkanModel;
 use crate::{
-    matvec_pc13, matvec_shader, matvec_variant, matvec_variant_core, matvec_mlx4_pc,
+    matvec_pc13, matvec_shader, matvec_variant, matvec_variant_by_format, matvec_mlx4_pc,
     matvec_mlx4_variant_k, nvfp4_dispatch, matvec_fp8_variant, matvec_fp8_pc,
-    use_subgroup_flag, matvec_rows_override,
     f32_slice_to_bytes, read_f32_buf,
     sdpa_pc, attn_decode_kernel,
 };
@@ -91,7 +90,7 @@ pub(crate) unsafe fn record_gemma_mv(
             eng.record_to(cb, &shader, &[&*wptr, &*s, &*inp, &*out], &pc, (wg, 1, 1)).unwrap();
         }
         MvKind::Plain => {
-            let (shader, r) = matvec_variant_core(format, use_subgroup_flag(), true, matvec_rows_override(), n);
+            let (shader, r) = matvec_variant_by_format(format, n);
             let wg = (n as u32 + r - 1) / r;
             let pc = matvec_pc13(k, n);
             eng.record_to(cb, &shader, &[&*wptr, &*inp, &*out], &pc, (wg, 1, 1)).unwrap();
@@ -157,7 +156,7 @@ pub(crate) unsafe fn record_gemma_mv_off(
                 &pc, (wg, 1, 1)).unwrap();
         }
         MvKind::Plain => {
-            let (shader, r) = matvec_variant_core(format, use_subgroup_flag(), true, matvec_rows_override(), n);
+            let (shader, r) = matvec_variant_by_format(format, n);
             let wg = (n as u32 + r - 1) / r;
             let pc = matvec_pc13(k, n);
             eng.record_to_off(cb, &shader,
@@ -403,10 +402,9 @@ impl VulkanModel {
     }
 
     /// Row-batched projection/FFN matmul for the Gemma4 batched prefill.
-    /// `[t,k] @ W[n,k]^T -> [t,n]`. CRITICAL: `gpu_gemm` is a blind **f16-only**
-    /// tiled GEMM (A_TYPE=f16 on binding 0), which silently misinterprets the
-    /// g12b/g31b MLX-affine 4-bit / 8-bit / NVFP4 packed weights as f16 and
-    /// yields NaN. Until the quantized batched-matmul kernel lands, dispatch each
+    /// `[t,k] @ W[n,k]^T -> [t,n]`. The tiled `gpu_gemm` path accepts plain F16
+    /// weights; packed g12b/g31b MLX-affine / Q8 / NVFP4 weights use their own
+    /// formats. Until the quantized batched-matmul kernel lands, dispatch each
     /// of the T rows through the FORMAT-AWARE single-row `gemma_tp_matvec` (reads
     /// the weight's own recorded format/aux via `gemma_res_mv_kind`, exactly like
     /// the decode path). Correct for every quant format; the per-row submits are

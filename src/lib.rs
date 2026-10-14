@@ -948,6 +948,15 @@ struct GpuWeight {
     aux: Option<QuantAux>,
 }
 
+impl GpuWeight {
+    /// Only a plain F16 allocation matches the tiled GEMM's binding-zero layout.
+    fn f16_gemm_buffer(&self) -> Option<&compute::Buffer> {
+        if self.format == QuantFormat::F16 && self.aux.is_none() {
+            Some(&self.buffer)
+        } else { None }
+    }
+}
+
 /// Recover a loaded matvec weight's `out_features` (row count) from its GPU
 /// buffer byte size, given the contraction dim `in_features`. Format-aware
 /// because bytes-per-element differ: FP8 = 1 raw byte, NVFP4 = 2 nibbles/byte,
@@ -7023,14 +7032,16 @@ impl VulkanModel {
     /// (BM=BN=64, BK=16), or the GEMM-campaign Phase 1 winner
     /// (`matmul_f16_f32_f16_aligned`, shape-keyed geometry — see
     /// `gemm_variant_k_available`) on the swept (k,n) shapes when available,
-    /// unless VLLM_VULKAN_GEMM_F16ALIGNED=0. CPU fallback when no engine/weight. This
+    /// unless VLLM_VULKAN_GEMM_F16ALIGNED=0. Other weight formats use host
+    /// weights, or format-aware matvecs when lean-host loading dropped them. This
     /// is the prefill lever: prompt processing is weight-bandwidth-bound, so
     /// one read for the whole prompt is ~t× less bandwidth than t sequential
     /// matvecs.
     pub(crate) fn gpu_gemm(&mut self, weight_name: &str, x: &[f32], t: usize, k: usize, n: usize) -> Vec<f32> {
         if let (Some(eng), Some(w_ptr)) = (
             self.engine.as_mut(),
-            self.gpu_weights.get(weight_name).map(|w| &w.buffer as *const compute::Buffer),
+            self.gpu_weights.get(weight_name).and_then(GpuWeight::f16_gemm_buffer)
+                .map(|buffer| buffer as *const compute::Buffer),
         ) {
             let (variant, bm, bn) = gemm_variant_k_available(k, n, |name| eng.has_pipeline(name));
             let (bm, bn) = (bm as usize, bn as usize);
@@ -7062,12 +7073,34 @@ impl VulkanModel {
             eng.return_to_pool(out);
             result
         } else {
-            // CPU fallback reads the base Gemma4 (`inner`) host weights → `gemma`.
             #[cfg(feature = "gemma")]
-            { let w = self.inner.weights.f32_slice(weight_name); model::cpu_matmul(x, w, t, k, n) }
+            { self.gemm_fallback(weight_name, x, t, k, n) }
             #[cfg(not(feature = "gemma"))]
             { let _ = (weight_name, x, k); vec![0.0f32; t * n] }
         }
+    }
+
+    /// Use the active architecture's CPU weights, or resident format-aware matvecs
+    /// when lean-host mode omitted that matrix. Never reinterpret its packed bytes.
+    #[cfg(feature = "gemma")]
+    pub(crate) fn gemm_fallback(&mut self, weight_name: &str, x: &[f32], t: usize, k: usize, n: usize) -> Vec<f32> {
+        let weights = match self.qwen.as_ref() {
+            Some(qwen) => &qwen.weights,
+            None => &self.inner.weights,
+        };
+        if weights.contains(weight_name) {
+            return model::cpu_matmul(x, weights.f32_slice(weight_name), t, k, n);
+        }
+        // A dropped host tensor is usable only while its resident weight and
+        // engine exist. Otherwise preserve the host store's missing-weight error.
+        if self.engine.is_none() || !self.gpu_weights.contains_key(weight_name) {
+            return model::cpu_matmul(x, weights.f32_slice(weight_name), t, k, n);
+        }
+        let mut out = Vec::with_capacity(t * n);
+        for token in 0..t {
+            out.extend(self.gemma_tp_matvec(weight_name, &x[token * k..(token + 1) * k], k, n, false));
+        }
+        out
     }
 
     /// GPU decode attention (single query over cached KV) via paged_attn_decode_f32
@@ -9548,6 +9581,18 @@ mod batched_forward_tests {
             spec_verify_cols: false,
             kv_store: None,
         }
+    }
+
+    /// A CPU GEMM fallback must read Qwen's store, or Gemma's after an arch switch.
+    #[test]
+    fn gemm_fallback_uses_the_active_architecture_weight_store() {
+        let mut m = tiny_qwen_model();
+        let name = "model.layers.0.self_attn.q_proj.weight";
+        let x = vec![0.25; 16];
+        let expected = model::cpu_matmul(&x, m.qwen.as_ref().unwrap().weights.f32_slice(name), 2, 8, 8);
+        assert_eq!(m.gpu_gemm(name, &x, 2, 8, 8), expected);
+        m.inner.weights = m.qwen.take().unwrap().weights;
+        assert_eq!(m.gpu_gemm(name, &x, 2, 8, 8), expected);
     }
 
     /// T=1 must be bit-exact vs the per-token `forward` — same math, same

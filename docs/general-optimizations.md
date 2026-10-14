@@ -26,6 +26,11 @@ execution graph. It starts from fork `main` at `fbccc82a49bf5e3a08ea41e62b5e92ac
   survived feature filtering. Otherwise they select `matmul_f16_f32_fp32` with
   its matching 64×64 tiles. Devices with FP16 storage but no FP16 arithmetic
   can therefore execute these projections after successful initialization.
+- **Weight-format-safe GEMM inputs.** Tiled F16 GEMMs accept only plain F16
+  weights without auxiliary buffers, including all three fused FFN projections.
+  Other formats use the active architecture's host weights. If lean-host mode
+  omitted those tensors, the existing per-format GPU matvecs serve each token
+  instead. Qwen3.5 F32 residency likewise uses its format-aware projection path.
 - **Aligned SPIR-V loading.** Eager and timeout-isolated compilation copy byte
   slices into aligned words with `ash::util::read_spv`; they no longer construct
   potentially unaligned `&[u32]` slices.
@@ -62,8 +67,9 @@ Run the existing feature slices with the new regression tests:
 ```sh
 cargo test --no-default-features --features multiple-pymethods,qwen35 --lib -- --skip device_conformance
 cargo test --no-default-features --features multiple-pymethods --lib -- --skip device_conformance
+cargo test --no-default-features --features multiple-pymethods,gemma,qwen35 --lib -- --skip device_conformance
 cargo check --tests
-VLLM_VULKAN_TEST_DEVICE=0 cargo test --no-default-features --features multiple-pymethods,qwen35 --lib device_conformance -- --nocapture
+VLLM_VULKAN_TEST_DEVICE=0 cargo test --no-default-features --features multiple-pymethods,gemma,qwen35 --lib device_conformance -- --nocapture
 ```
 
 The optional `debug-api` feature references `src/debug_api.rs`, which is absent
@@ -81,6 +87,9 @@ GEMM selection tests cover missing preferred pipelines and preservation of
 available geometries. GPU tests disable FP16 arithmetic in the cache's
 capabilities and execute the selected FP32 fallback across partial tiles,
 checking every output against a CPU reference.
+Caller-level tests reject non-F16 and auxiliary-buffer layouts, check every
+fused FFN weight, preserve the plain-F16 GPU route, and compare lean-host
+Q4/Q8/BF16/F32 projections against decoded CPU references.
 
 A manually enabled CPU checkpoint audit and paired benchmark is also available:
 
@@ -102,9 +111,10 @@ for the measured CPU rather than asserted for every architecture.
 | --- | --- |
 | Qwen feature CPU suite | 230 passed; GPU tests run separately |
 | Foundation CPU suite | 148 passed; GPU tests run separately |
+| Combined Gemma/Qwen CPU suite | 300 passed; GPU tests run separately |
 | Default production model features and tests | `cargo check --tests` passed |
-| RX560X conformance | 8 tests passed; 18 quant kernels and FP32 GEMM fallback executed; FP16 subgroup isolation skipped |
-| Vega 8 conformance | 8 tests passed; 20 quant kernels and FP32 GEMM fallback executed; FP16 subgroup isolation exercised |
+| RX560X conformance (Gemma/Qwen features) | 12 tests passed; 18 quant kernels, GEMM fallback and weight-format callers exercised; FP16 subgroup isolation skipped |
+| Vega 8 conformance (Gemma/Qwen features) | 12 tests passed; 20 quant kernels, GEMM fallback and weight-format callers exercised; FP16 subgroup isolation exercised |
 | Checkpoint embedding audit | All 508,559,360 values bit-identical |
 | Paired CPU embedding benchmark | 2.553x measured median speedup |
 
