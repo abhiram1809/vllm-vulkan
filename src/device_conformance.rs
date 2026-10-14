@@ -619,10 +619,10 @@ fn sweep(engine: &mut ComputeEngine, fp16: bool) -> Report {
 
 // ─── tests ───────────────────────────────────────────────────────────────────
 
-/// Build a `ComputeEngine` on device 0, or `None` when the machine has no
+/// Build a `ComputeEngine` on VLLM_VULKAN_TEST_DEVICE (default 0), or `None` when the machine has no
 /// Vulkan ICD (the default CI job). This is the single place the whole module
 /// no-ops through.
-fn engine_or_skip() -> Option<(ComputeEngine, bool, u32)> {
+fn engine_or_skip() -> Option<(ComputeEngine, bool, u32, u64)> {
     if !device::is_vulkan_available() {
         eprintln!(
             "device_conformance: no Vulkan device (no ICD) — GPU conformance SKIPPED. \
@@ -631,8 +631,13 @@ fn engine_or_skip() -> Option<(ComputeEngine, bool, u32)> {
         );
         return None;
     }
-    let dev = device::ComputeDevice::create(0).expect("Vulkan reported available but device 0 failed to create");
+    let device_idx = std::env::var("VLLM_VULKAN_TEST_DEVICE").unwrap_or_else(|_| "0".into())
+        .parse::<usize>().expect("VLLM_VULKAN_TEST_DEVICE must be a nonnegative device index");
+    let dev = device::ComputeDevice::create(device_idx)
+        .expect("Vulkan reported available but selected test device failed to create");
     let (fp16, subgroup) = (dev.fp16, dev.subgroup_size);
+    let alignment = unsafe { dev.instance.get_physical_device_properties(dev.physical_device) }
+        .limits.min_storage_buffer_offset_alignment.max(4);
     let spvs = include_all_shaders();
     let refs: std::collections::HashMap<&str, &[u8]> =
         spvs.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
@@ -646,14 +651,14 @@ fn engine_or_skip() -> Option<(ComputeEngine, bool, u32)> {
         &refs,
     )
     .expect("ComputeEngine::new failed on an available device");
-    Some((engine, fp16, subgroup))
+    Some((engine, fp16, subgroup, alignment))
 }
 
 /// Every quant matvec kernel this branch ships, run for real against the CPU
 /// dequant reference. No-ops (PASS) with no device.
 #[test]
 fn quant_matvec_kernels_match_cpu_reference() {
-    let Some((mut engine, fp16, subgroup)) = engine_or_skip() else { return };
+    let Some((mut engine, fp16, subgroup, _alignment)) = engine_or_skip() else { return };
     eprintln!("device_conformance: subgroup_size={subgroup} fp16={fp16} k={K} n={N} tol={TOL:e}");
 
     let report = sweep(&mut engine, fp16);
@@ -690,7 +695,7 @@ fn quant_matvec_kernels_match_cpu_reference() {
 /// every other assertion in this file is worthless.
 #[test]
 fn harness_detects_a_corrupted_reference() {
-    let Some((mut engine, _fp16, _sg)) = engine_or_skip() else { return };
+    let Some((mut engine, _fp16, _sg, _alignment)) = engine_or_skip() else { return };
     const NAME: &str = "mul_mat_vec_mlx4_f32_f32";
     if !engine.has_pipeline(NAME) {
         eprintln!("device_conformance: {NAME} not compiled here — fail-injection SKIPPED");
@@ -740,4 +745,90 @@ fn every_matvec_kernel_is_covered_or_excused() {
          line saying why a numerical check is not possible.",
         uncovered.len()
     );
+}
+
+
+#[test]
+fn offset_descriptors_preserve_slices_and_recover_after_invalid_bindings() {
+    let Some((mut engine, _fp16, _sg, alignment)) = engine_or_skip() else {
+        return;
+    };
+    let prefix = (alignment / 4) as usize;
+    let n = 32usize;
+    let a_values: Vec<f32> = (0..prefix + n + prefix).map(|i| i as f32).collect();
+    let b_values: Vec<f32> = a_values.iter().map(|v| v * 2.0).collect();
+    let untouched = vec![-17.0f32; a_values.len()];
+    let a = engine.alloc_device((a_values.len() * 4) as u64).unwrap();
+    let b = engine.alloc_device(a.size).unwrap();
+    let output = engine.alloc_device(a.size).unwrap();
+    engine.upload(&a, &f32_bytes(&a_values)).unwrap();
+    engine.upload(&b, &f32_bytes(&b_values)).unwrap();
+    engine.upload(&output, &f32_bytes(&untouched)).unwrap();
+    let pc = crate::push_constants::ew_mul_pc(n as u32);
+    let cb = engine.begin_batch().unwrap();
+    let too_many = vec![(&a, alignment); crate::pipeline::MAX_BINDINGS as usize + 1];
+    assert!(engine
+        .record_to_off(cb, "add_f32_f32_f32", &too_many, &pc, (1, 1, 1))
+        .unwrap_err()
+        .contains("MAX_BINDINGS"));
+    // Continue the same live recording after rejection, without resetting it.
+    engine
+        .record_to_off(
+            cb,
+            "add_f32_f32_f32",
+            &[
+                (&a, alignment),
+                (&b, alignment),
+                (&output, alignment),
+                (&output, alignment),
+            ],
+            &pc,
+            (1, 1, 1),
+        )
+        .unwrap();
+    engine.record_barrier_to(cb);
+    engine
+        .record_to_off(
+            cb,
+            "add_f32_f32_f32",
+            &[
+                (&output, alignment),
+                (&b, alignment),
+                (&output, alignment),
+                (&output, alignment),
+            ],
+            &pc,
+            (1, 1, 1),
+        )
+        .unwrap();
+    engine.submit_batch(cb).unwrap();
+    let mut bytes = Vec::new();
+    engine.download(&output, &mut bytes).unwrap();
+    let actual: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+        .collect();
+    for i in 0..actual.len() {
+        let expected = if (prefix..prefix + n).contains(&i) {
+            a_values[i] + b_values[i] + b_values[i]
+        } else {
+            untouched[i]
+        };
+        assert_eq!(actual[i].to_bits(), expected.to_bits(), "element{i}");
+    }
+}
+
+
+#[test]
+fn unsupported_shader_variants_are_rejected_before_compilation() {
+    let Some((mut engine, fp16, _sg, _alignment)) = engine_or_skip() else { return };
+    if fp16 { return; }
+    let shaders = include_all_shaders();
+    let shader = &shaders["matmul_f16_f32_f16_aligned"];
+    let message = engine.compile_extra_variant("unsupported_f16_eager", shader, &[]).unwrap_err();
+    assert!(message.contains("requires unavailable feature"));
+    let message = engine.compile_variant_timeout("unsupported_f16_timeout", shader, &[], 1000).unwrap_err();
+    assert!(message.contains("requires unavailable feature"));
+    assert!(!engine.has_pipeline("unsupported_f16_eager"));
+    assert!(!engine.has_pipeline("unsupported_f16_timeout"));
 }

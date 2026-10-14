@@ -807,6 +807,7 @@ impl ComputeEngine {
             self.device
                 .cmd_copy_buffer(cb, staging.buffer, dst.buffer, &[copy]);
         }
+        self.record_transfer_to_compute_barrier(cb);
         self.end_and_submit(cb)?;
 
         // staging dropped here, freeing the host buffer.
@@ -823,6 +824,7 @@ impl ComputeEngine {
         let staging = self.alloc_staging(size)?;
 
         let cb = self.begin_one_shot()?;
+        self.record_compute_to_transfer_barrier(cb);
         let copy = vk::BufferCopy::default()
             .src_offset(0)
             .dst_offset(0)
@@ -831,6 +833,7 @@ impl ComputeEngine {
             self.device
                 .cmd_copy_buffer(cb, src.buffer, staging.buffer, &[copy]);
         }
+        self.record_transfer_to_host_barrier(cb);
         self.end_and_submit(cb)?;
 
         out.resize(size as usize, 0);
@@ -857,6 +860,7 @@ impl ComputeEngine {
     }
 
     fn end_and_submit(&self, cb: vk::CommandBuffer) -> Result<(), String> {
+        self.record_compute_to_host_barrier(cb);
         unsafe { self.device.end_command_buffer(cb) }
             .map_err(|e| format!("end_command_buffer: {e}"))?;
 
@@ -990,6 +994,13 @@ impl ComputeEngine {
         workgroups: (u32, u32, u32),
     ) -> Result<(), String> {
         self.assert_owner();
+        let n = buffers.len();
+        if n > MAX_BINDINGS as usize {
+            return Err(format!(
+                "record_to_off: {n} buffers exceeds MAX_BINDINGS ({MAX_BINDINGS})"
+            ));
+        }
+
         let (vk_pipeline, vk_layout) = {
             let pipeline = self
                 .pipeline_cache
@@ -1000,26 +1011,46 @@ impl ComputeEngine {
 
         let ds = self.next_descriptor_set()?;
 
-        let buffer_infos: Vec<vk::DescriptorBufferInfo> = buffers
-            .iter()
-            .map(|(b, off)| vk::DescriptorBufferInfo::default()
-                .buffer(b.buffer).offset(*off).range(vk::WHOLE_SIZE))
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = buffer_infos.iter().enumerate()
-            .map(|(i, info)| vk::WriteDescriptorSet::default()
-                .dst_set(ds).dst_binding(i as u32)
+        // Match record_to's stack storage; row-offset dispatches are also hot.
+        let mut buffer_infos = [vk::DescriptorBufferInfo::default(); MAX_BINDINGS as usize];
+        for (i, (b, off)) in buffers.iter().enumerate() {
+            buffer_infos[i] = vk::DescriptorBufferInfo::default()
+                .buffer(b.buffer)
+                .offset(*off)
+                .range(vk::WHOLE_SIZE);
+        }
+        let mut writes = [vk::WriteDescriptorSet::default(); MAX_BINDINGS as usize];
+        for i in 0..n {
+            writes[i] = vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(i as u32)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(std::slice::from_ref(info)))
-            .collect();
-        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+                .buffer_info(std::slice::from_ref(&buffer_infos[i]));
+        }
+        unsafe { self.device.update_descriptor_sets(&writes[..n], &[]) };
 
         unsafe {
             if !push_constants.is_empty() {
-                self.device.cmd_push_constants(cb, vk_layout, vk::ShaderStageFlags::COMPUTE, 0, push_constants);
+                self.device.cmd_push_constants(
+                    cb,
+                    vk_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    push_constants,
+                );
             }
-            self.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, vk_pipeline);
-            self.device.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, vk_layout, 0, &[ds], &[]);
-            self.device.cmd_dispatch(cb, workgroups.0, workgroups.1, workgroups.2);
+            self.device
+                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, vk_pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                vk_layout,
+                0,
+                &[ds],
+                &[],
+            );
+            self.device
+                .cmd_dispatch(cb, workgroups.0, workgroups.1, workgroups.2);
         }
         Ok(())
     }
@@ -1031,7 +1062,7 @@ impl ComputeEngine {
     pub fn record_barrier_to(&self, cb: vk::CommandBuffer) {
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
         unsafe {
             self.device.cmd_pipeline_barrier(
                 cb,
@@ -1076,7 +1107,7 @@ impl ComputeEngine {
     pub fn record_transfer_to_compute_barrier(&self, cb: vk::CommandBuffer) {
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
         unsafe {
             self.device.cmd_pipeline_barrier(
                 cb,
@@ -1104,6 +1135,40 @@ impl ComputeEngine {
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[barrier], &[], &[],
+            );
+        }
+    }
+
+    pub fn record_transfer_to_host_barrier(&self, cb: vk::CommandBuffer) {
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
+
+    pub fn record_compute_to_host_barrier(&self, cb: vk::CommandBuffer) {
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
             );
         }
     }
@@ -1153,6 +1218,7 @@ impl ComputeEngine {
         // GPU-exec drain (NOT direct-submit-addressable).
         let _t_qs = std::time::Instant::now();
         // End + submit + wait, but DO NOT free the CB (reused next begin_batch).
+        self.record_compute_to_host_barrier(cb);
         unsafe { self.device.end_command_buffer(cb) }
             .map_err(|e| format!("end batch_cb: {e}"))?;
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
@@ -1189,6 +1255,7 @@ impl ComputeEngine {
     pub fn submit_batch_async(&mut self, cb: vk::CommandBuffer) -> Result<(), String> {
         self.assert_owner();
         let _t_qs = std::time::Instant::now();
+        self.record_compute_to_host_barrier(cb);
         unsafe { self.device.end_command_buffer(cb) }
             .map_err(|e| format!("end batch_cb (async): {e}"))?;
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
@@ -1340,6 +1407,7 @@ impl ComputeEngine {
     ) -> Result<(), String> {
         self.assert_owner();
         let slot = self.ring_cur_slot;
+        self.record_compute_to_host_barrier(cb);
         unsafe { self.device.end_command_buffer(cb) }
             .map_err(|e| format!("end ring cb: {e}"))?;
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
