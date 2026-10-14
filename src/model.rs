@@ -3071,9 +3071,38 @@ impl PackedEmbed {
     /// f16 lookup (`f16::from_bits(table[...]).to_f32()`) would yield.
     #[inline]
     pub fn row_f32(&self, token: usize) -> Vec<f32> {
-        self.row_f16(token)
-            .iter()
-            .map(|&b| half::f16::from_bits(b).to_f32())
+        if self.bits == 4 && self.group_size == 64 && self.hidden % 64 == 0 {
+            return self.row_f32_fast64(token);
+        }
+        let per_word = 32 / self.bits;
+        let mask = (1u32 << self.bits) - 1;
+        let words = self.hidden / per_word;
+        let groups = self.hidden / self.group_size;
+        let packed = &self.packed[token * words..(token + 1) * words];
+        let scales = &self.scales[token * groups..(token + 1) * groups];
+        let biases = &self.biases[token * groups..(token + 1) * groups];
+        (0..self.hidden)
+            .map(|i| {
+                let q = ((packed[i / per_word] >> ((i % per_word) * self.bits)) & mask) as f32;
+                let value = scales[i / self.group_size] * q + biases[i / self.group_size];
+                half::f16::from_f32(value).to_f32()
+            })
+            .collect()
+    }
+
+    fn row_f32_fast64(&self, token: usize) -> Vec<f32> {
+        let words = self.hidden / 8;
+        let groups = self.hidden / 64;
+        let packed = &self.packed[token * words..(token + 1) * words];
+        let scales = &self.scales[token * groups..(token + 1) * groups];
+        let biases = &self.biases[token * groups..(token + 1) * groups];
+        (0..self.hidden)
+            .map(|i| {
+                let q = ((packed[i >> 3] >> ((i & 7) * 4)) & 15) as f32;
+                // Keep the original FP32 affine operations and FP16 rounding.
+                let value = scales[i >> 6] * q + biases[i >> 6];
+                half::f16::from_f32(value).to_f32()
+            })
             .collect()
     }
 
@@ -5557,6 +5586,189 @@ pub fn gemma_inject_kv_layer(
 #[cfg(test)]
 mod quant_tests {
     use super::*;
+
+    #[test]
+    fn packed_embed_f32_preserves_rounding_edges() {
+        for hidden in [64usize, 128, 2048] {
+            let vocab = 32;
+            let groups = hidden / 64;
+            let coefficients = [
+                0.0f32,
+                -0.0,
+                2f32.powi(-24),
+                2f32.powi(-14),
+                0.5,
+                1.00048828125,
+                65504.0 / 15.0,
+                -65504.0 / 15.0,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NAN,
+            ];
+            let pe = PackedEmbed {
+                packed: (0..vocab * hidden / 8)
+                    .map(|i| (i as u32).wrapping_mul(2654435761).wrapping_add(0x76543210))
+                    .collect(),
+                scales: (0..vocab * groups)
+                    .map(|i| coefficients[i % coefficients.len()])
+                    .collect(),
+                biases: (0..vocab * groups)
+                    .map(|i| coefficients[(i * 7 + 3) % coefficients.len()])
+                    .collect(),
+                vocab,
+                hidden,
+                group_size: 64,
+                bits: 4,
+            };
+            for token in 0..vocab {
+                let reference = pe.row_f16(token);
+                let actual = pe.row_f32(token);
+                for (i, (&bits, &v)) in reference.iter().zip(&actual).enumerate() {
+                    assert_eq!(
+                        half::f16::from_bits(bits).to_f32().to_bits(),
+                        v.to_bits(),
+                        "row{token} element{i}"
+                    );
+                }
+            }
+        }
+    }
+
+
+
+    #[test]
+    fn packed_embed_f32_matches_original_for_other_formats() {
+        for bits in [2usize, 4, 6, 8] {
+            let hidden = (32 / bits) * 64;
+            for group_size in [32usize, 64] {
+                let vocab = 7;
+                let groups = hidden / group_size;
+                let pe = PackedEmbed {
+                    packed: (0..vocab * hidden / (32 / bits))
+                        .map(|i| (i as u32).wrapping_mul(2654435761))
+                        .collect(),
+                    scales: (0..vocab * groups)
+                        .map(|i| (i as f32 - 17.0) * 0.03125)
+                        .collect(),
+                    biases: (0..vocab * groups)
+                        .map(|i| (i as f32 - 23.0) * 0.0625)
+                        .collect(),
+                    vocab,
+                    hidden,
+                    group_size,
+                    bits,
+                };
+                for token in 0..vocab {
+                    let expected = pe.row_f16(token);
+                    let actual = pe.row_f32(token);
+                    for (&bits, &value) in expected.iter().zip(&actual) {
+                        assert_eq!(
+                            half::f16::from_bits(bits).to_f32().to_bits(),
+                            value.to_bits()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run manually with a group64 MLX4/BF16 safetensors checkpoint. No model
+    /// download, GPU initialization or model-specific Python API is needed.
+    #[test]
+    #[ignore = "Set VLLM_VULKAN_EMBED_BENCH_MODEL to a local MLX4 checkpoint"]
+    fn packed_embed_checkpoint_benchmark() {
+        let path =
+            std::env::var("VLLM_VULKAN_EMBED_BENCH_MODEL").expect("local checkpoint path required");
+        let file = std::fs::File::open(path).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let tensors = safetensors::SafeTensors::deserialize(&mmap).unwrap();
+        let names = tensors.names();
+        let name = names
+            .into_iter()
+            .find(|name| name.ends_with("embed_tokens.weight"))
+            .expect("embedding tensor");
+        let prefix = name.strip_suffix(".weight").unwrap();
+        let packed = tensors.tensor(name).unwrap();
+        let scales = tensors.tensor(&format!("{prefix}.scales")).unwrap();
+        let biases = tensors.tensor(&format!("{prefix}.biases")).unwrap();
+        assert_eq!(packed.dtype(), safetensors::Dtype::U32);
+        assert_eq!(scales.dtype(), safetensors::Dtype::BF16);
+        assert_eq!(biases.dtype(), safetensors::Dtype::BF16);
+        let vocab = packed.shape()[0];
+        let hidden = packed.shape()[1] * 8;
+        assert_eq!(scales.shape(), &[vocab, hidden / 64]);
+        assert_eq!(biases.shape(), scales.shape());
+        let bf16 = |data: &[u8]| {
+            data.chunks_exact(2)
+                .map(|v| f32::from_bits((u16::from_le_bytes(v.try_into().unwrap()) as u32) << 16))
+                .collect()
+        };
+        let pe = PackedEmbed {
+            packed: packed
+                .data()
+                .chunks_exact(4)
+                .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+                .collect(),
+            scales: bf16(scales.data()),
+            biases: bf16(biases.data()),
+            vocab,
+            hidden,
+            group_size: 64,
+            bits: 4,
+        };
+        let pe = std::hint::black_box(pe);
+        let baseline = |token| {
+            pe.row_f16(token)
+                .iter()
+                .map(|&v| half::f16::from_bits(v).to_f32())
+                .collect::<Vec<_>>()
+        };
+        for token in 0..vocab {
+            let expected = baseline(token);
+            let actual = pe.row_f32(token);
+            for (&a, &b) in expected.iter().zip(&actual) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+        }
+        eprintln!(
+            "embedding checkpoint bit audit PASS: {} values",
+            vocab * hidden
+        );
+        for fast in [false, true] {
+            for i in 0..1000 {
+                let values = if fast {
+                    pe.row_f32(i % vocab)
+                } else {
+                    baseline(i % vocab)
+                };
+                std::hint::black_box(values);
+            }
+        }
+        let mut times = [Vec::new(), Vec::new()];
+        for fast in [false, true, true, false, false, true, true, false] {
+            let start = std::time::Instant::now();
+            for i in 0..10000 {
+                let token = (i * 15427) % vocab;
+                let values = if fast {
+                    pe.row_f32(token)
+                } else {
+                    baseline(token)
+                };
+                std::hint::black_box(values);
+            }
+            times[usize::from(fast)].push(start.elapsed().as_secs_f64());
+        }
+        for arm in &mut times {
+            arm.sort_by(|a, b| a.total_cmp(b));
+        }
+        let median = |v: &[f64]| (v[1] + v[2]) * 0.5;
+        eprintln!(
+            "paired CPU seconds per10000rows: baseline={:?}, fused={:?}; speedup={:.3}x",
+            times[0],
+            times[1],
+            median(&times[0]) / median(&times[1])
+        );
+    }
 
     /// The packed-resident embed (`PackedEmbed::row_f16`, the per-token decode
     /// used at the first PP stage) must be BIT-EXACT to the corresponding row of
