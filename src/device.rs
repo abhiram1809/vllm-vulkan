@@ -245,8 +245,14 @@ pub fn synchronize_all() -> Result<(), String> {
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceCaps {
     pub subgroup_size: u32,
+    pub shader_float16: bool,
+    pub shader_float64: bool,
+    pub shader_int8: bool,
     pub shader_int64: bool,
     pub shader_int16: bool,
+    pub shader_integer_dot_product: bool,
+    pub storage_buffer_16_bit_access: bool,
+    pub storage_buffer_8_bit_access: bool,
 }
 
 // ─── Logical device access (for compute) ─────────────────────────────────────
@@ -264,6 +270,12 @@ pub struct ComputeDevice {
     pub max_workgroup_invocations: u32,
     pub shader_int64: bool,
     pub shader_int16: bool,
+    pub shader_int8: bool,
+    pub shader_float16: bool,
+    pub shader_float64: bool,
+    pub shader_integer_dot_product: bool,
+    pub storage_buffer_16_bit_access: bool,
+    pub storage_buffer_8_bit_access: bool,
 }
 
 // ComputeDevice does NOT implement Drop — ownership of `device` is transferred
@@ -297,6 +309,12 @@ impl ComputeDevice {
 
         // Query device capabilities.
         let props = unsafe { instance.get_physical_device_properties(pd) };
+        if props.api_version < vk::API_VERSION_1_3 {
+            return Err(format!(
+                "Vulkan 1.3 is required by the compiled SPIR-V shaders; device supports {}",
+                api_version_str(props.api_version)
+            ));
+        }
 
         // f16 KV-cache shaders need both f16 storage buffers and f16 shader
         // arithmetic/conversion. The fork additionally queries 8-bit storage
@@ -310,23 +328,27 @@ impl ComputeDevice {
         let (
             storage_buffer_16_bit_access,
             shader_float16,
+            has_int8,
             has_float64,
             storage_buffer_8_bit_access,
             has_int64,
             has_int16,
             maintenance4,
             shader_subgroup_extended_types,
+            shader_integer_dot_product,
         ) = unsafe {
             let mut features16 = vk::PhysicalDevice16BitStorageFeatures::default();
             let mut features8 = vk::PhysicalDevice8BitStorageFeatures::default();
             let mut float16_int8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
             let mut maint4 = vk::PhysicalDeviceMaintenance4Features::default();
+            let mut integer_dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
             let mut subgroup_ext_types =
                 vk::PhysicalDeviceShaderSubgroupExtendedTypesFeatures::default();
             let p16 = &mut features16 as *mut vk::PhysicalDevice16BitStorageFeatures;
             let p8 = &mut features8 as *mut vk::PhysicalDevice8BitStorageFeatures;
             let pf16 = &mut float16_int8 as *mut vk::PhysicalDeviceShaderFloat16Int8Features;
             let pm4 = &mut maint4 as *mut vk::PhysicalDeviceMaintenance4Features;
+            let pidot = &mut integer_dot as *mut vk::PhysicalDeviceShaderIntegerDotProductFeatures;
             let pset =
                 &mut subgroup_ext_types as *mut vk::PhysicalDeviceShaderSubgroupExtendedTypesFeatures;
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
@@ -334,6 +356,7 @@ impl ComputeDevice {
                 .push_next(&mut *p8)
                 .push_next(&mut *p16)
                 .push_next(&mut *pm4)
+                .push_next(&mut *pidot)
                 .push_next(&mut *pset);
             instance.get_physical_device_features2(pd, &mut features2);
             // Read results from the raw pointers — safe because Vulkan has
@@ -341,17 +364,22 @@ impl ComputeDevice {
             let storage16_val = (*p16).storage_buffer16_bit_access == vk::TRUE;
             let storage8_val = (*p8).storage_buffer8_bit_access == vk::TRUE;
             let shader_f16_val = (*pf16).shader_float16 == vk::TRUE;
+            let i8_val = (*pf16).shader_int8 == vk::TRUE;
             let f64_val  = features2.features.shader_float64 == vk::TRUE;
             let i64_val  = features2.features.shader_int64   == vk::TRUE;
             let i16_val  = features2.features.shader_int16   == vk::TRUE;
             let maint4_val = (*pm4).maintenance4 == vk::TRUE;
             let subgroup_ext_types_val = (*pset).shader_subgroup_extended_types == vk::TRUE;
+            let integer_dot_val = (*pidot).shader_integer_dot_product == vk::TRUE;
             (
-                storage16_val, shader_f16_val, f64_val, storage8_val, i64_val, i16_val,
-                maint4_val, subgroup_ext_types_val,
+                storage16_val, shader_f16_val, i8_val, f64_val, storage8_val, i64_val, i16_val,
+                maint4_val, subgroup_ext_types_val, integer_dot_val,
             )
         };
         let fp16 = storage_buffer_16_bit_access && shader_float16;
+        if !maintenance4 {
+            return Err("The compiled SPIR-V shaders require the maintenance4 feature".to_owned());
+        }
 
         let device_features = vk::PhysicalDeviceFeatures {
             shader_float64: if has_float64 { vk::TRUE } else { vk::FALSE },
@@ -388,12 +416,15 @@ impl ComputeDevice {
         };
         let mut enabled_float16_int8 = vk::PhysicalDeviceShaderFloat16Int8Features {
             shader_float16: if shader_float16 { vk::TRUE } else { vk::FALSE },
+            shader_int8: if has_int8 { vk::TRUE } else { vk::FALSE },
             ..Default::default()
         };
         // 8-bit storage: required for q8_0/q4_0/... weight structs (int8_t qs).
         // The extension was enabled above but the FEATURE must be turned on too,
         // else int8 storage reads silently return 0 (q-matvec → all-zero logits).
-        let enable8 = storage_buffer_8_bit_access && available_names.contains(&&*ext_storage8);
+        // Storage8 is core in Vulkan 1.2; a 1.3 device need not advertise the
+        // old extension name in order to expose the feature.
+        let enable8 = storage_buffer_8_bit_access;
         let mut enabled_features8 = vk::PhysicalDevice8BitStorageFeatures {
             storage_buffer8_bit_access: if enable8 { vk::TRUE } else { vk::FALSE },
             ..Default::default()
@@ -404,6 +435,10 @@ impl ComputeDevice {
         };
         let mut enabled_subgroup_ext_types = vk::PhysicalDeviceShaderSubgroupExtendedTypesFeatures {
             shader_subgroup_extended_types: if shader_subgroup_extended_types { vk::TRUE } else { vk::FALSE },
+            ..Default::default()
+        };
+        let mut enabled_integer_dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures {
+            shader_integer_dot_product: if shader_integer_dot_product { vk::TRUE } else { vk::FALSE },
             ..Default::default()
         };
 
@@ -417,7 +452,7 @@ impl ComputeDevice {
         if enable8 {
             device_ci = device_ci.push_next(&mut enabled_features8);
         }
-        if shader_float16 {
+        if shader_float16 || has_int8 {
             device_ci = device_ci.push_next(&mut enabled_float16_int8);
         }
         // Required (core Vulkan 1.3) for every compiled shader — see
@@ -430,8 +465,11 @@ impl ComputeDevice {
         if shader_subgroup_extended_types {
             device_ci = device_ci.push_next(&mut enabled_subgroup_ext_types);
         }
+        if shader_integer_dot_product {
+            device_ci = device_ci.push_next(&mut enabled_integer_dot);
+        }
 
-        log::info!("8bit_storage={enable8} 16bit_storage={storage_buffer_16_bit_access} float16={shader_float16}");
+        log::info!("8bit_storage={enable8} 16bit_storage={storage_buffer_16_bit_access} float16={shader_float16} int8={has_int8} integer_dot_product={shader_integer_dot_product}");
         let device = unsafe { instance.create_device(pd, &device_ci, None) }
             .map_err(|e| format!("vkCreateDevice: {e}"))?;
 
@@ -455,14 +493,26 @@ impl ComputeDevice {
             max_workgroup_invocations: props.limits.max_compute_work_group_invocations,
             shader_int64: has_int64,
             shader_int16: has_int16,
+            shader_int8: has_int8,
+            shader_float16,
+            shader_float64: has_float64,
+            shader_integer_dot_product,
+            storage_buffer_16_bit_access,
+            storage_buffer_8_bit_access: enable8,
         })
     }
 
     pub fn caps(&self) -> DeviceCaps {
         DeviceCaps {
             subgroup_size: self.subgroup_size,
+            shader_float16: self.shader_float16,
+            shader_float64: self.shader_float64,
+            shader_int8: self.shader_int8,
             shader_int64: self.shader_int64,
             shader_int16: self.shader_int16,
+            shader_integer_dot_product: self.shader_integer_dot_product,
+            storage_buffer_16_bit_access: self.storage_buffer_16_bit_access,
+            storage_buffer_8_bit_access: self.storage_buffer_8_bit_access,
         }
     }
 }

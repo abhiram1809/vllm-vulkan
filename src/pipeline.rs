@@ -38,10 +38,63 @@ pub struct Pipeline {
 /// One allocation of push-constant data (up to 128 bytes).
 pub type PushConstants = Vec<u8>;
 
+/// Return an unavailable feature required by this module's SPIR-V capability
+/// declarations. Storage-only narrow types do not imply narrow arithmetic.
+fn unsupported_shader_capability(
+    spv: &[u8],
+    caps: crate::device::DeviceCaps,
+) -> Result<Option<&'static str>, String> {
+    if spv.len() < 20 || spv.len() % 4 != 0 {
+        return Err(format!("invalid SPIR-V byte length {}", spv.len()));
+    }
+    let word =
+        |i: usize| -> u32 { u32::from_le_bytes(spv[i * 4..i * 4 + 4].try_into().unwrap()) };
+    if word(0) != 0x0723_0203 {
+        return Err("invalid SPIR-V magic".to_owned());
+    }
+    let words = spv.len() / 4;
+    let mut i = 5;
+    while i < words {
+        let instruction = word(i);
+        let count = (instruction >> 16) as usize;
+        if count == 0 || count > words - i {
+            return Err(format!("malformed SPIR-V instruction at word {i}"));
+        }
+        if instruction & 0xffff == 17 {
+            // OpCapability
+            if count != 2 {
+                return Err(format!("malformed OpCapability at word {i}"));
+            }
+            let feature = match word(i + 1) {
+                9 if !caps.shader_float16 => Some("shaderFloat16"),
+                10 if !caps.shader_float64 => Some("shaderFloat64"),
+                11 if !caps.shader_int64 => Some("shaderInt64"),
+                22 if !caps.shader_int16 => Some("shaderInt16"),
+                39 if !caps.shader_int8 => Some("shaderInt8"),
+                4433 if !caps.storage_buffer_16_bit_access => Some("storageBuffer16BitAccess"),
+                4448 if !caps.storage_buffer_8_bit_access => Some("storageBuffer8BitAccess"),
+                6019 if !caps.shader_integer_dot_product => Some("shaderIntegerDotProduct"),
+                _ => None,
+            };
+            if feature.is_some() {
+                return Ok(feature);
+            }
+        }
+        i += count;
+    }
+    Ok(None)
+}
+
+/// Byte slices (including include_bytes!) need not have u32 alignment.
+fn read_shader_spirv(spv: &[u8]) -> Result<Vec<u32>, String> {
+    ash::util::read_spv(&mut std::io::Cursor::new(spv)).map_err(|e| format!("read SPIR-V: {e}"))
+}
+
 /// Manages a set of compute pipelines for one logical device.
 pub struct PipelineCache {
     device: ash::Device,
     subgroup_size: u32,
+    caps: crate::device::DeviceCaps,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
     pipelines: HashMap<String, Pipeline>,
 }
@@ -60,6 +113,23 @@ impl PipelineCache {
         caps: crate::device::DeviceCaps,
         shader_spvs: &HashMap<&str, &[u8]>,
     ) -> Result<Self, String> {
+        // Inspect declared capabilities rather than shader names. Narrow
+        // storage and FP32 accumulation do not imply narrow arithmetic.
+        let mut supported = HashMap::new();
+        let mut unsupported = HashMap::new();
+        for (&name, &spv) in shader_spvs {
+            match unsupported_shader_capability(spv, caps)
+                .map_err(|e| format!("SPIR-V for '{name}': {e}"))?
+            {
+                Some(feature) => {
+                    log::warn!("skipping '{name}': device does not support {feature}");
+                    unsupported.insert(name, feature);
+                }
+                None => { supported.insert(name, spv); }
+            }
+        }
+        let shader_spvs = &supported;
+
         // One global descriptor set layout with MAX_BINDINGS storage buffers.
         let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..MAX_BINDINGS)
             .map(|i| {
@@ -79,6 +149,7 @@ impl PipelineCache {
         let mut cache = PipelineCache {
             device: device.clone(),
             subgroup_size: caps.subgroup_size,
+            caps,
             descriptor_set_layout: dsl,
             pipelines: HashMap::new(),
         };
@@ -181,6 +252,7 @@ impl PipelineCache {
             Some(&spv) => cache
                 .compile_mul_mm_narrow(NARROW_SRC, spv)
                 .map_err(|e| format!("PipelineCache: {NARROW_SRC}_bn8 failed to compile: {e}"))?,
+            None if unsupported.contains_key(NARROW_SRC) => {},
             None => {
                 return Err(format!(
                     "PipelineCache: source shader '{NARROW_SRC}' not found in shader_spvs; \
@@ -252,6 +324,7 @@ impl PipelineCache {
                         .map_err(|e| format!("PipelineCache: {MV_COLS_SRC} cols variant: {e}"))?;
                 }
             }
+            None if unsupported.contains_key(MV_COLS_SRC) => {},
             None => {
                 return Err(format!(
                     "PipelineCache: source shader '{MV_COLS_SRC}' not found in shader_spvs; \
@@ -345,15 +418,14 @@ impl PipelineCache {
         spec_constants: &[(u32, u32)], // (constantID, value) pairs
     ) -> Result<(), String> {
         // Validate SPIR-V alignment.
+        if let Some(feature) = unsupported_shader_capability(spv, self.caps)? {
+            return Err(format!("Shader '{name}' requires unavailable feature {feature}"));
+        }
         if spv.len() % 4 != 0 {
             return Err(format!("SPIR-V for '{name}' has unaligned size {}", spv.len()));
         }
-        // Re-interpret as &[u32].
-        let code: &[u32] = unsafe {
-            std::slice::from_raw_parts(spv.as_ptr() as *const u32, spv.len() / 4)
-        };
-
-        let module_ci = vk::ShaderModuleCreateInfo::default().code(code);
+        let code = read_shader_spirv(spv)?;
+        let module_ci = vk::ShaderModuleCreateInfo::default().code(&code);
         let module = unsafe { self.device.create_shader_module(&module_ci, None) }
             .map_err(|e| format!("create_shader_module for '{name}': {e}"))?;
 
@@ -529,6 +601,9 @@ impl PipelineCache {
         spec_constants: &[(u32, u32)],
         timeout: std::time::Duration,
     ) -> Result<bool, String> {
+        if let Some(feature) = unsupported_shader_capability(spv, self.caps)? {
+            return Err(format!("Shader '{name}' requires unavailable feature {feature}"));
+        }
         if spv.len() % 4 != 0 {
             return Err(format!("SPIR-V for '{name}' has unaligned size {}", spv.len()));
         }
@@ -540,10 +615,8 @@ impl PipelineCache {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = (|| -> Result<(vk::ShaderModule, vk::PipelineLayout, vk::Pipeline), String> {
-                let code: &[u32] = unsafe {
-                    std::slice::from_raw_parts(spv_owned.as_ptr() as *const u32, spv_owned.len() / 4)
-                };
-                let module_ci = vk::ShaderModuleCreateInfo::default().code(code);
+                let code = read_shader_spirv(&spv_owned)?;
+                let module_ci = vk::ShaderModuleCreateInfo::default().code(&code);
                 let module = unsafe { device.create_shader_module(&module_ci, None) }
                     .map_err(|e| format!("create_shader_module for '{name_owned}': {e}"))?;
                 let pc_range = vk::PushConstantRange::default()
@@ -1046,7 +1119,121 @@ pub(crate) fn cols_block_size(name: &str, cols: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::cols_block_size;
+    use super::{cols_block_size, read_shader_spirv, unsupported_shader_capability};
+
+
+    fn storage_only_caps() -> crate::device::DeviceCaps {
+        crate::device::DeviceCaps {
+            subgroup_size: 32,
+            shader_float16: false,
+            shader_float64: false,
+            shader_int8: true,
+            shader_int64: true,
+            shader_int16: true,
+            shader_integer_dot_product: true,
+            storage_buffer_16_bit_access: true,
+            storage_buffer_8_bit_access: true,
+        }
+    }
+
+    #[test]
+    fn narrow_storage_does_not_require_float16_arithmetic() {
+        let shaders = crate::include_all_shaders();
+        for name in [
+            "mul_mat_vec_f16_f32_f32",
+            "mul_mat_vec_q4_kdeq_f32_f32",
+            "mul_mat_vec_q8_0_cols",
+        ] {
+            assert_eq!(
+                unsupported_shader_capability(&shaders[name], storage_only_caps()).unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            unsupported_shader_capability(
+                &shaders["matmul_f16_f32_f16_aligned"],
+                storage_only_caps()
+            )
+            .unwrap(),
+            Some("shaderFloat16")
+        );
+    }
+
+    #[test]
+    fn declared_capabilities_require_enabled_device_features() {
+        let encode = |words: &[u32]| {
+            words
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>()
+        };
+        let mut caps = storage_only_caps();
+        caps.shader_int8 = false;
+        caps.shader_int16 = false;
+        caps.shader_int64 = false;
+        caps.shader_integer_dot_product = false;
+        caps.storage_buffer_16_bit_access = false;
+        caps.storage_buffer_8_bit_access = false;
+        for (capability, feature) in [
+            (9, "shaderFloat16"),
+            (10, "shaderFloat64"),
+            (11, "shaderInt64"),
+            (22, "shaderInt16"),
+            (39, "shaderInt8"),
+            (4433, "storageBuffer16BitAccess"),
+            (4448, "storageBuffer8BitAccess"),
+            (6019, "shaderIntegerDotProduct"),
+        ] {
+            let module = encode(&[
+                0x0723_0203,
+                0x0001_0600,
+                0,
+                1,
+                0,
+                (2 << 16) | 17,
+                capability,
+            ]);
+            assert_eq!(
+                unsupported_shader_capability(&module, caps).unwrap(),
+                Some(feature)
+            );
+        }
+    }
+
+    #[test]
+    fn capability_parser_rejects_malformed_modules() {
+        let encode = |words: &[u32]| {
+            words
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>()
+        };
+        for words in [
+            vec![0; 5],
+            vec![0x0723_0203, 0, 0, 0, 0, 0],
+            vec![0x0723_0203, 0, 0, 0, 0, (2 << 16) | 17],
+            vec![0x0723_0203, 0, 0, 0, 0, (1 << 16) | 17],
+        ] {
+            assert!(unsupported_shader_capability(&encode(&words), storage_only_caps()).is_err());
+        }
+        assert!(unsupported_shader_capability(&[0; 19], storage_only_caps()).is_err());
+        assert!(unsupported_shader_capability(&[0; 21], storage_only_caps()).is_err());
+    }
+
+    #[test]
+    fn spirv_reader_accepts_unaligned_byte_slices() {
+        let shaders = crate::include_all_shaders();
+        let shader = &shaders["mul_mat_vec_q8_0_f32_f32"];
+        let mut padded = vec![0];
+        padded.extend_from_slice(shader);
+        let actual = read_shader_spirv(&padded[1..]).unwrap();
+        let expected: Vec<u32> = shader
+            .chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(read_shader_spirv(&[0; 7]).is_err());
+    }
 
     // rows the caller passes for a given cols (rows*cols <= 8 envelope).
     fn rows_for(cols: u32) -> u32 {
