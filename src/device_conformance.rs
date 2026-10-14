@@ -865,6 +865,59 @@ fn disabled_subgroup_extended_types_skip_attention_and_reject_variants() {
     assert!(!engine.has_pipeline("unsupported_subgroup_timeout"));
 }
 
+/// Select and dispatch the FP32 fallback after filtering all FP16 arithmetic pipelines.
+#[test]
+fn gemm_selection_without_fp16_arithmetic_uses_supported_tiles() {
+    let Some((mut engine, _fp16, _sg, _alignment)) =
+        engine_or_skip_with_caps(|caps| caps.shader_float16 = false)
+    else { return };
+    if !engine.has_pipeline("matmul_f16_f32_fp32") {
+        eprintln!("GEMM fallback dispatch SKIPPED: device lacks FP16 storage");
+        return;
+    }
+    assert!(!engine.has_pipeline("matmul_f16_f32_f16_aligned"));
+    // This shape normally selects a 64×32 FP16 arithmetic geometry sibling.
+    let (variant, bm, bn) = crate::push_constants::gemm_variant_k_available(
+        2048, 8192, |name| engine.has_pipeline(name),
+    );
+    assert_eq!((variant.as_str(), bm, bn), ("matmul_f16_f32_fp32", 64, 64));
+
+    // The fallback is shape-independent. Exercise partial row/column tiles
+    // with small buffers, using the selected kernel and its returned geometry.
+    let (t, n, k) = (65usize, 96usize, 128usize);
+    let weights: Vec<f32> = (0..n).flat_map(|r| {
+        std::iter::repeat_n(((r % 9) as i32 - 4) as f32 * 0.125, k)
+    }).collect();
+    let input: Vec<f32> = (0..t).flat_map(|token| {
+        (0..k).map(move |j| ((j + token) % 17) as f32 * 0.125)
+    }).collect();
+    let weight_bytes: Vec<u8> = weights.iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes()).collect();
+    let w = engine.alloc_host_coherent_storage(weight_bytes.len() as u64).unwrap();
+    let x = engine.alloc_host_coherent_storage((input.len() * 4) as u64).unwrap();
+    let out = engine.alloc_host_coherent_storage((t * n * 4) as u64).unwrap();
+    w.write(&weight_bytes).unwrap();
+    x.write(&f32_bytes(&input)).unwrap();
+    out.write(&f32_bytes(&vec![-1.0e9; t * n])).unwrap();
+    let cb = engine.begin_batch().unwrap();
+    engine.record_to(
+        cb, &variant, &[&w, &x, &out], &crate::push_constants::gemm_pc(t, n, k),
+        (n.div_ceil(bm as usize) as u32, t.div_ceil(bn as usize) as u32, 1),
+    ).unwrap();
+    engine.submit_batch(cb).unwrap();
+    let mut bytes = vec![0; out.size as usize];
+    out.read(&mut bytes).unwrap();
+    for token in 0..t {
+        for row in 0..n {
+            let expected: f32 = input[token * k..(token + 1) * k].iter()
+                .zip(&weights[row * k..(row + 1) * k]).map(|(x, w)| x * w).sum();
+            let offset = (token * n + row) * 4;
+            let actual = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            assert_eq!(actual, expected, "token {token}, row {row}");
+        }
+    }
+}
+
 /// Read shader output and copied snapshots directly after sync, async and ring waits.
 #[test]
 fn batch_snapshot_copies_are_visible_to_host() {

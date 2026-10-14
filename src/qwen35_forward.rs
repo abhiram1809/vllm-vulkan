@@ -16,7 +16,7 @@ use crate::{
     matvec_mlx4_variant_k,
     nvfp4_dispatch, matvec_fp8_variant, matvec_fp8_pc, matvec_f32_variant,
     matvec_f32_variant_k,
-    gemm_pc, gemm_variant_k, gemm_pc_mlx4, gemm_pc_mlx4_id, gemm_pc_mlx4_id_gateup,
+    gemm_pc, gemm_variant_k_available, gemm_pc_mlx4, gemm_pc_mlx4_id, gemm_pc_mlx4_id_gateup,
     gemm_variant_quant_k, gemm_variant_quant_id_bn, gemm_quant_flag,
     ew_unary_pc, ew_mul_pc, rmsnorm_pc, rope_neox_pc,
     q35_conv_pc, q35_qknorm_pc, q35_gdn_pc, q35_gdn_scan_pc, q35_moe_accum_pc,
@@ -369,8 +369,8 @@ impl VulkanModel {
             // (K,N) shapes -- see gemm_variant_k.
             let gpc = gemm_pc(t, inter, h);   // gate/up: N=inter, K=h
             let dpc = gemm_pc(t, h, inter);   // down:    N=h,     K=inter
-            let (g_variant, g_bm, g_bn) = gemm_variant_k(h, inter);
-            let (d_variant, d_bm, d_bn) = gemm_variant_k(inter, h);
+            let (g_variant, g_bm, g_bn) = gemm_variant_k_available(h, inter, |name| eng.has_pipeline(name));
+            let (d_variant, d_bm, d_bn) = gemm_variant_k_available(inter, h, |name| eng.has_pipeline(name));
             let gwg = (((inter + g_bm as usize - 1) / g_bm as usize) as u32,
                        ((t + g_bn as usize - 1) / g_bn as usize) as u32, 1u32);
             let dwg = (((h + d_bm as usize - 1) / d_bm as usize) as u32,
@@ -2577,8 +2577,6 @@ impl VulkanModel {
                 return out;
             }
         }
-        let (variant, bm, bn) = gemm_variant_k(k, n);
-        let (bm, bn) = (bm as usize, bn as usize);
         // The `matmul_f16_f32_*` GEMM family only knows how to read a PLAIN
         // f16/f32 weight buffer — no batched-T GEMM variant exists for
         // Q8_0/Nvfp4/Fp8-resident weights (unlike `qwen35_matvec`, which picks
@@ -2593,6 +2591,8 @@ impl VulkanModel {
             .filter(|w| w.aux.is_none() && matches!(w.format, crate::flags::QuantFormat::F16 | crate::flags::QuantFormat::F32))
             .map(|w| &w.buffer as *const compute::Buffer);
         if let (Some(eng), Some(w_ptr)) = (self.engine.as_mut(), plain_gpu) {
+            let (variant, bm, bn) = gemm_variant_k_available(k, n, |name| eng.has_pipeline(name));
+            let (bm, bn) = (bm as usize, bn as usize);
             let xb = f32_slice_to_bytes(x);
             let inp = eng.alloc_host_coherent_storage((t * k * 4) as u64).unwrap();
             inp.write(&xb).unwrap();

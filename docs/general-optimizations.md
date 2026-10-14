@@ -21,6 +21,11 @@ execution graph. It starts from fork `main` at `fbccc82a49bf5e3a08ea41e62b5e92ac
   require [`shaderSubgroupExtendedTypes`](https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-None-06275); FP16 storage and FP32 subgroup arithmetic
   alone do not. Unsupported optional shaders remain absent;
   a genuinely missing required source still produces an error.
+- **Availability-aware GEMM dispatch.** The shared and Qwen GEMM callers,
+  including the fused Qwen FFN, use a preferred geometry only when its pipeline
+  survived feature filtering. Otherwise they select `matmul_f16_f32_fp32` with
+  its matching 64×64 tiles. Devices with FP16 storage but no FP16 arithmetic
+  can therefore execute these projections after successful initialization.
 - **Aligned SPIR-V loading.** Eager and timeout-isolated compilation copy byte
   slices into aligned words with `ash::util::read_spv`; they no longer construct
   potentially unaligned `&[u32]` slices.
@@ -35,7 +40,7 @@ execution graph. It starts from fork `main` at `fbccc82a49bf5e3a08ea41e62b5e92ac
   and lets the same suite test another adapter on a multi-GPU machine.
 
 These changes do not introduce new Python APIs or inference flags. The compiled
-shader sources and their existing launch parameters are unchanged.
+shader sources and each pipeline's existing tile geometry are unchanged.
 
 ## Evaluation of the remaining experiment changes
 
@@ -72,6 +77,10 @@ cover missing features, storage-only FP16, malformed modules and unaligned
 byte slices. GPU tests compare the existing quantized kernels against CPU
 references and exercise aligned offset descriptors, in-place updates, untouched
 neighboring slices and a valid dispatch after rejecting excess bindings.
+GEMM selection tests cover missing preferred pipelines and preservation of
+available geometries. GPU tests disable FP16 arithmetic in the cache's
+capabilities and execute the selected FP32 fallback across partial tiles,
+checking every output against a CPU reference.
 
 A manually enabled CPU checkpoint audit and paired benchmark is also available:
 
@@ -91,11 +100,11 @@ for the measured CPU rather than asserted for every architecture.
 
 | Check | Result |
 | --- | --- |
-| Qwen feature CPU suite | 229 passed; GPU tests run separately |
+| Qwen feature CPU suite | 230 passed; GPU tests run separately |
 | Foundation CPU suite | 148 passed; GPU tests run separately |
 | Default production model features and tests | `cargo check --tests` passed |
-| RX560X conformance | 7 tests passed; 18 quant kernels executed; FP16 subgroup isolation skipped |
-| Vega 8 conformance | 7 tests passed; 20 quant kernels executed; FP16 subgroup isolation exercised |
+| RX560X conformance | 8 tests passed; 18 quant kernels and FP32 GEMM fallback executed; FP16 subgroup isolation skipped |
+| Vega 8 conformance | 8 tests passed; 20 quant kernels and FP32 GEMM fallback executed; FP16 subgroup isolation exercised |
 | Checkpoint embedding audit | All 508,559,360 values bit-identical |
 | Paired CPU embedding benchmark | 2.553x measured median speedup |
 

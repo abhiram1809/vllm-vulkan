@@ -7022,18 +7022,18 @@ impl VulkanModel {
     /// per token). Uses the `matmul_f16_f32_fp32` mul_mm kernel by default
     /// (BM=BN=64, BK=16), or the GEMM-campaign Phase 1 winner
     /// (`matmul_f16_f32_f16_aligned`, shape-keyed geometry — see
-    /// `gemm_variant_k`) on the swept (k,n) shapes, unless
-    /// VLLM_VULKAN_GEMM_F16ALIGNED=0. CPU fallback when no engine/weight. This
+    /// `gemm_variant_k_available`) on the swept (k,n) shapes when available,
+    /// unless VLLM_VULKAN_GEMM_F16ALIGNED=0. CPU fallback when no engine/weight. This
     /// is the prefill lever: prompt processing is weight-bandwidth-bound, so
     /// one read for the whole prompt is ~t× less bandwidth than t sequential
     /// matvecs.
     pub(crate) fn gpu_gemm(&mut self, weight_name: &str, x: &[f32], t: usize, k: usize, n: usize) -> Vec<f32> {
-        let (variant, bm, bn) = gemm_variant_k(k, n);
-        let (bm, bn) = (bm as usize, bn as usize);
         if let (Some(eng), Some(w_ptr)) = (
             self.engine.as_mut(),
             self.gpu_weights.get(weight_name).map(|w| &w.buffer as *const compute::Buffer),
         ) {
+            let (variant, bm, bn) = gemm_variant_k_available(k, n, |name| eng.has_pipeline(name));
+            let (bm, bn) = (bm as usize, bn as usize);
             let xb = f32_slice_to_bytes(x);
             let inp = eng.alloc_host_coherent_storage((t * k * 4) as u64).unwrap();
             inp.write(&xb).unwrap();
