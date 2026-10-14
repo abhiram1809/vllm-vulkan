@@ -251,6 +251,7 @@ pub struct DeviceCaps {
     pub shader_int64: bool,
     pub shader_int16: bool,
     pub shader_integer_dot_product: bool,
+    pub shader_subgroup_extended_types: bool,
     pub storage_buffer_16_bit_access: bool,
     pub storage_buffer_8_bit_access: bool,
 }
@@ -274,6 +275,7 @@ pub struct ComputeDevice {
     pub shader_float16: bool,
     pub shader_float64: bool,
     pub shader_integer_dot_product: bool,
+    pub shader_subgroup_extended_types: bool,
     pub storage_buffer_16_bit_access: bool,
     pub storage_buffer_8_bit_access: bool,
 }
@@ -497,11 +499,13 @@ impl ComputeDevice {
             shader_float16,
             shader_float64: has_float64,
             shader_integer_dot_product,
+            shader_subgroup_extended_types,
             storage_buffer_16_bit_access,
             storage_buffer_8_bit_access: enable8,
         })
     }
 
+    /// Return the features enabled on this logical device for shader filtering.
     pub fn caps(&self) -> DeviceCaps {
         DeviceCaps {
             subgroup_size: self.subgroup_size,
@@ -511,6 +515,7 @@ impl ComputeDevice {
             shader_int64: self.shader_int64,
             shader_int16: self.shader_int16,
             shader_integer_dot_product: self.shader_integer_dot_product,
+            shader_subgroup_extended_types: self.shader_subgroup_extended_types,
             storage_buffer_16_bit_access: self.storage_buffer_16_bit_access,
             storage_buffer_8_bit_access: self.storage_buffer_8_bit_access,
         }

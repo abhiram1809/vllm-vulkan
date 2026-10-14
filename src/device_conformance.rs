@@ -623,6 +623,13 @@ fn sweep(engine: &mut ComputeEngine, fp16: bool) -> Report {
 /// Vulkan ICD (the default CI job). This is the single place the whole module
 /// no-ops through.
 fn engine_or_skip() -> Option<(ComputeEngine, bool, u32, u64)> {
+    engine_or_skip_with_caps(|_| {})
+}
+
+/// Adjust advertised capabilities to exercise optional-feature filtering on real GPUs.
+fn engine_or_skip_with_caps(
+    adjust_caps: impl FnOnce(&mut device::DeviceCaps),
+) -> Option<(ComputeEngine, bool, u32, u64)> {
     if !device::is_vulkan_available() {
         eprintln!(
             "device_conformance: no Vulkan device (no ICD) — GPU conformance SKIPPED. \
@@ -641,13 +648,15 @@ fn engine_or_skip() -> Option<(ComputeEngine, bool, u32, u64)> {
     let spvs = include_all_shaders();
     let refs: std::collections::HashMap<&str, &[u8]> =
         spvs.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+    let mut caps = dev.caps();
+    adjust_caps(&mut caps);
     let engine = ComputeEngine::new(
         dev.instance.clone(),
         dev.physical_device,
         dev.device.clone(),
         dev.compute_queue,
         dev.compute_queue_family,
-        dev.caps(),
+        caps,
         &refs,
     )
     .expect("ComputeEngine::new failed on an available device");
@@ -831,4 +840,79 @@ fn unsupported_shader_variants_are_rejected_before_compilation() {
     assert!(message.contains("requires unavailable feature"));
     assert!(!engine.has_pipeline("unsupported_f16_eager"));
     assert!(!engine.has_pipeline("unsupported_f16_timeout"));
+}
+
+/// Simulate a missing subgroup feature at startup and in both variant compilers.
+#[test]
+fn disabled_subgroup_extended_types_skip_attention_and_reject_variants() {
+    let Some((mut engine, fp16, _sg, _alignment)) =
+        engine_or_skip_with_caps(|caps| caps.shader_subgroup_extended_types = false)
+    else { return };
+    if !fp16 {
+        eprintln!("subgroup feature isolation SKIPPED: device lacks FP16 arithmetic/storage");
+        return;
+    }
+    let name = "flash_attn_f32_f16_f32_f16acc";
+    assert!(!engine.has_pipeline(name));
+    assert!(engine.has_pipeline("flash_attn_f32_f16_f32_fp32"));
+    let shaders = include_all_shaders();
+    let shader = &shaders[name];
+    let message = engine.compile_extra_variant("unsupported_subgroup_eager", shader, &[]).unwrap_err();
+    assert!(message.contains("shaderSubgroupExtendedTypes"));
+    let message = engine.compile_variant_timeout("unsupported_subgroup_timeout", shader, &[], 1000).unwrap_err();
+    assert!(message.contains("shaderSubgroupExtendedTypes"));
+    assert!(!engine.has_pipeline("unsupported_subgroup_eager"));
+    assert!(!engine.has_pipeline("unsupported_subgroup_timeout"));
+}
+
+/// Read shader output and copied snapshots directly after sync, async and ring waits.
+#[test]
+fn batch_snapshot_copies_are_visible_to_host() {
+    let Some((mut engine, _fp16, _sg, _alignment)) = engine_or_skip() else { return };
+    let n = 32usize;
+    let source = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+    let computed = engine.alloc_host_coherent_storage(source.size).unwrap();
+    let snapshot = engine.alloc_host_coherent_storage(source.size + 8).unwrap();
+    let copied = engine.alloc_host_coherent_storage(source.size).unwrap();
+    for mode in 0..if engine.ring_active() { 3 } else { 2 } {
+        let values: Vec<f32> = (0..n).map(|i| i as f32 + mode as f32).collect();
+        source.write(&f32_bytes(&values)).unwrap();
+        computed.write(&vec![0; computed.size as usize]).unwrap();
+        snapshot.write(&vec![0xa5; snapshot.size as usize]).unwrap();
+        copied.write(&vec![0; copied.size as usize]).unwrap();
+        let cb = if mode == 2 {
+            engine.begin_forward_ring().unwrap();
+            engine.begin_batch_pipelined().unwrap()
+        } else { engine.begin_batch().unwrap() };
+        engine.record_to(
+            cb, "add_f32_f32_f32", &[&source, &source, &computed, &computed],
+            &crate::push_constants::ew_mul_pc(n as u32), (1, 1, 1),
+        ).unwrap();
+        engine.record_compute_to_transfer_barrier(cb);
+        engine.record_copy_to(cb, &computed, &snapshot, 0, 4, computed.size);
+        // Also exercise a transfer-only destination that has no shader writes.
+        engine.record_copy_to(cb, &source, &copied, 0, 0, source.size);
+        match mode {
+            0 => engine.submit_batch(cb).unwrap(),
+            1 => {
+                engine.submit_batch_async(cb).unwrap();
+                engine.wait_batch().unwrap();
+            }
+            _ => {
+                engine.submit_batch_pipelined(cb, Vec::new()).unwrap();
+                engine.wait_batch_pipelined().unwrap();
+            }
+        }
+        let expected = f32_bytes(&values.iter().map(|v| v + v).collect::<Vec<_>>());
+        let mut bytes = vec![0; computed.size as usize];
+        computed.read(&mut bytes).unwrap();
+        assert_eq!(bytes, expected, "direct shader read, mode {mode}");
+        copied.read(&mut bytes).unwrap();
+        assert_eq!(bytes, f32_bytes(&values), "transfer-only read, mode {mode}");
+        bytes.resize(snapshot.size as usize, 0);
+        snapshot.read(&mut bytes).unwrap();
+        assert_eq!(&bytes[4..4 + expected.len()], expected, "snapshot read, mode {mode}");
+        assert_eq!(&bytes[..4], &[0xa5; 4]);
+        assert_eq!(&bytes[4 + expected.len()..], &[0xa5; 4]);
+    }
 }

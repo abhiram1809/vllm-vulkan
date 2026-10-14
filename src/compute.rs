@@ -1139,6 +1139,7 @@ impl ComputeEngine {
         }
     }
 
+    /// Make completed buffer copies visible to subsequent mapped host reads.
     pub fn record_transfer_to_host_barrier(&self, cb: vk::CommandBuffer) {
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -1156,14 +1157,16 @@ impl ComputeEngine {
         }
     }
 
+    /// Make shader writes and batch snapshot copies visible to mapped host reads.
+    /// The caller must also wait for the submission's fence before reading.
     pub fn record_compute_to_host_barrier(&self, cb: vk::CommandBuffer) {
         let barrier = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::HOST_READ);
         unsafe {
             self.device.cmd_pipeline_barrier(
                 cb,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
                 &[barrier],

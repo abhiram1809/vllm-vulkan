@@ -16,15 +16,19 @@ execution graph. It starts from fork `main` at `fbccc82a49bf5e3a08ea41e62b5e92ac
   Excess bindings return an error before consuming a descriptor set.
 - **Device capabilities drive shader availability.** Query and enable supported
   integer arithmetic, integer-dot and narrow-storage features. Inspect SPIR-V
-  capabilities before startup, eager and timeout-isolated variant compilation. Narrow storage
-  does not imply FP16 arithmetic. Unsupported optional shaders remain absent;
+  capabilities and subgroup operand/result types before startup, eager and
+  timeout-isolated variant compilation. Extended-type subgroup operations
+  require [`shaderSubgroupExtendedTypes`](https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-None-06275); FP16 storage and FP32 subgroup arithmetic
+  alone do not. Unsupported optional shaders remain absent;
   a genuinely missing required source still produces an error.
 - **Aligned SPIR-V loading.** Eager and timeout-isolated compilation copy byte
   slices into aligned words with `ash::util::read_spv`; they no longer construct
   potentially unaligned `&[u32]` slices.
 - **Explicit transfer and host dependencies.** Order uploads before compute,
   compute before downloads, and device writes before mapped host reads. Compute
-  and transfer dependencies include shader writes for in-place consumers. Host
+  and transfer dependencies include shader writes for in-place consumers. Batch
+  host dependencies cover both shader writes and transfer-written snapshots
+  across synchronous, asynchronous and ring submissions. Host
   coherency does not replace a memory dependency; see the
   [Khronos synchronization examples](https://docs.vulkan.org/guide/latest/synchronization_examples.html).
 - **Selectable conformance device.** `VLLM_VULKAN_TEST_DEVICE` defaults to zero
@@ -87,11 +91,11 @@ for the measured CPU rather than asserted for every architecture.
 
 | Check | Result |
 | --- | --- |
-| Qwen feature CPU suite | 227 passed; GPU tests run separately |
-| Foundation CPU suite | 146 passed; GPU tests run separately |
+| Qwen feature CPU suite | 229 passed; GPU tests run separately |
+| Foundation CPU suite | 148 passed; GPU tests run separately |
 | Default production model features and tests | `cargo check --tests` passed |
-| RX560X conformance | 5 tests passed; 18 quant kernels executed |
-| Vega 8 conformance | 5 tests passed; 18 quant kernels executed |
+| RX560X conformance | 7 tests passed; 18 quant kernels executed; FP16 subgroup isolation skipped |
+| Vega 8 conformance | 7 tests passed; 20 quant kernels executed; FP16 subgroup isolation exercised |
 | Checkpoint embedding audit | All 508,559,360 values bit-identical |
 | Paired CPU embedding benchmark | 2.553x measured median speedup |
 

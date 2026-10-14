@@ -6,7 +6,7 @@
 //! buffer bindings (matching the llama.cpp convention).
 
 use ash::vk;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Maximum number of storage buffer bindings per pipeline.
 pub const MAX_BINDINGS: u32 = 12;
@@ -39,7 +39,8 @@ pub struct Pipeline {
 pub type PushConstants = Vec<u8>;
 
 /// Return an unavailable feature required by this module's SPIR-V capability
-/// declarations. Storage-only narrow types do not imply narrow arithmetic.
+/// declarations and typed subgroup operations. Storage-only narrow types do
+/// not imply narrow arithmetic or extended-type subgroup operations.
 fn unsupported_shader_capability(
     spv: &[u8],
     caps: crate::device::DeviceCaps,
@@ -53,6 +54,8 @@ fn unsupported_shader_capability(
         return Err("invalid SPIR-V magic".to_owned());
     }
     let words = spv.len() / 4;
+    let mut extended_types = HashSet::new();
+    let mut extended_values = HashSet::new();
     let mut i = 5;
     while i < words {
         let instruction = word(i);
@@ -60,7 +63,8 @@ fn unsupported_shader_capability(
         if count == 0 || count > words - i {
             return Err(format!("malformed SPIR-V instruction at word {i}"));
         }
-        if instruction & 0xffff == 17 {
+        let opcode = instruction & 0xffff;
+        if opcode == 17 {
             // OpCapability
             if count != 2 {
                 return Err(format!("malformed OpCapability at word {i}"));
@@ -78,6 +82,48 @@ fn unsupported_shader_capability(
             };
             if feature.is_some() {
                 return Ok(feature);
+            }
+        }
+        if !caps.shader_subgroup_extended_types {
+            // There is no GroupNonUniformExtendedTypes SPIR-V capability.
+            // VUID-RuntimeSpirv-None-06275 instead checks the types used by
+            // group operations: int8/16/64, float16, and their vectors.
+            match opcode {
+                21..=23 => { // OpTypeInt, OpTypeFloat, OpTypeVector
+                    // OpTypeFloat may also carry an optional FPEncoding.
+                    let valid_count = if opcode == 22 {
+                        (3..=4).contains(&count)
+                    } else { count == 4 };
+                    if !valid_count {
+                        return Err(format!("malformed numeric type at word {i}"));
+                    }
+                    let extended = match opcode {
+                        21 => matches!(word(i + 2), 8 | 16 | 64),
+                        22 => word(i + 2) == 16,
+                        _ => extended_types.contains(&word(i + 2)),
+                    };
+                    if extended { extended_types.insert(word(i + 1)); }
+                }
+                333..=366 | 4431 => { // OpGroupNonUniform*, including RotateKHR
+                    if count < 4 || (opcode == 336 && count != 5) {
+                        return Err(format!("malformed subgroup operation at word {i}"));
+                    }
+                    if extended_types.contains(&word(i + 1))
+                        // AllEqual returns bool; inspect its value operand.
+                        || (opcode == 336 && extended_values.contains(&word(i + 4)))
+                    {
+                        return Ok(Some("shaderSubgroupExtendedTypes"));
+                    }
+                }
+                _ => {
+                    // Numeric value definitions begin with Result Type and
+                    // Result ID. Types precede constants and functions in a
+                    // valid module, so remember extended-typed values for
+                    // AllEqual without treating an unused type as a requirement.
+                    if count >= 3 && extended_types.contains(&word(i + 1)) {
+                        extended_values.insert(word(i + 2));
+                    }
+                }
             }
         }
         i += count;
@@ -1131,6 +1177,7 @@ mod tests {
             shader_int64: true,
             shader_int16: true,
             shader_integer_dot_product: true,
+            shader_subgroup_extended_types: true,
             storage_buffer_16_bit_access: true,
             storage_buffer_8_bit_access: true,
         }
@@ -1200,6 +1247,89 @@ mod tests {
         }
     }
 
+    /// Build the type declarations and a typed subgroup instruction for the filter.
+    fn subgroup_module(scalar_opcode: u32, width: u32, vector: bool, opcode: u32) -> Vec<u8> {
+        let mut words = vec![0x0723_0203, 0x0001_0600, 0, 32, 0];
+        words.extend_from_slice(&[(2 << 16) | 20, 1]); // OpTypeBool
+        words.extend_from_slice(&[(4 << 16) | 21, 2, 32, 0]); // uint32
+        if scalar_opcode == 21 {
+            words.extend_from_slice(&[(4 << 16) | 21, 3, width, 0]);
+        } else {
+            words.extend_from_slice(&[(3 << 16) | 22, 3, width]);
+        }
+        let value_type = if vector {
+            words.extend_from_slice(&[(4 << 16) | 23, 4, 3, 4]); // OpTypeVector
+            4
+        } else { 3 };
+        words.extend_from_slice(&[(4 << 16) | 43, 2, 6, 3]); // Subgroup scope constant
+        words.extend_from_slice(&[(3 << 16) | 1, value_type, 7]); // OpUndef
+        if opcode == 336 { // AllEqual: bool result, typed value operand
+            words.extend_from_slice(&[(5 << 16) | opcode, 1, 8, 6, 7]);
+        } else { // Shuffle: typed result and value operand
+            words.extend_from_slice(&[(6 << 16) | opcode, value_type, 8, 6, 7, 6]);
+        }
+        words.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// Gate extended scalar/vector subgroup values, including bool-returning votes.
+    #[test]
+    fn subgroup_operations_require_extended_types_only_when_used() {
+        let mut caps = storage_only_caps();
+        caps.shader_float16 = true;
+        caps.shader_float64 = true;
+        caps.shader_subgroup_extended_types = false;
+        for (scalar_opcode, width, needs_feature) in [
+            (21, 8, true), (21, 16, true), (21, 64, true), (22, 16, true),
+            (21, 32, false), (22, 32, false), (22, 64, false),
+        ] {
+            for vector in [false, true] {
+                for opcode in [345, 336] {
+                    let module = subgroup_module(scalar_opcode, width, vector, opcode);
+                    assert_eq!(
+                        unsupported_shader_capability(&module, caps).unwrap(),
+                        needs_feature.then_some("shaderSubgroupExtendedTypes"),
+                        "type opcode={scalar_opcode} width={width} vector={vector} group opcode={opcode}"
+                    );
+                    let enabled = crate::device::DeviceCaps {
+                        shader_subgroup_extended_types: true,
+                        ..caps
+                    };
+                    assert_eq!(unsupported_shader_capability(&module, enabled).unwrap(), None);
+                }
+            }
+        }
+        // Explicitly encoded 16-bit floats still require the subgroup feature.
+        let module = subgroup_module(22, 16, false, 345);
+        let mut words = read_shader_spirv(&module).unwrap();
+        let float_type = words.iter().position(|&w| w == ((3 << 16) | 22)).unwrap();
+        words[float_type] = (4 << 16) | 22;
+        words.insert(float_type + 3, 0); // BFloat16KHR encoding
+        let encoded: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            unsupported_shader_capability(&encoded, caps).unwrap(),
+            Some("shaderSubgroupExtendedTypes")
+        );
+    }
+
+    /// Check shipped attention modules without rejecting fp16 storage or fp32 groups.
+    #[test]
+    fn attention_subgroup_filter_distinguishes_arithmetic_from_storage() {
+        let shaders = crate::include_all_shaders();
+        let mut caps = storage_only_caps();
+        caps.shader_float16 = true;
+        caps.shader_subgroup_extended_types = false;
+        for name in ["flash_attn_f32_f16_f32_f16acc", "flash_attn_f32_f16_f16_f16acc"] {
+            assert_eq!(
+                unsupported_shader_capability(&shaders[name], caps).unwrap(),
+                Some("shaderSubgroupExtendedTypes"),
+                "{name}"
+            );
+        }
+        for name in ["flash_attn_f32_f16_f32", "flash_attn_f32_f16_f32_fp32"] {
+            assert_eq!(unsupported_shader_capability(&shaders[name], caps).unwrap(), None, "{name}");
+        }
+    }
+
     #[test]
     fn capability_parser_rejects_malformed_modules() {
         let encode = |words: &[u32]| {
@@ -1213,8 +1343,16 @@ mod tests {
             vec![0x0723_0203, 0, 0, 0, 0, 0],
             vec![0x0723_0203, 0, 0, 0, 0, (2 << 16) | 17],
             vec![0x0723_0203, 0, 0, 0, 0, (1 << 16) | 17],
+            vec![0x0723_0203, 0, 0, 0, 0, (2 << 16) | 21, 1],
+            vec![0x0723_0203, 0, 0, 0, 0, (2 << 16) | 22, 1],
+            vec![0x0723_0203, 0, 0, 0, 0, (2 << 16) | 23, 1],
+            vec![0x0723_0203, 0, 0, 0, 0, (2 << 16) | 345, 1],
         ] {
-            assert!(unsupported_shader_capability(&encode(&words), storage_only_caps()).is_err());
+            let caps = crate::device::DeviceCaps {
+                shader_subgroup_extended_types: false,
+                ..storage_only_caps()
+            };
+            assert!(unsupported_shader_capability(&encode(&words), caps).is_err());
         }
         assert!(unsupported_shader_capability(&[0; 19], storage_only_caps()).is_err());
         assert!(unsupported_shader_capability(&[0; 21], storage_only_caps()).is_err());
