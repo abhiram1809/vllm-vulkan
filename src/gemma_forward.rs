@@ -54,12 +54,11 @@ pub(crate) fn gemma_res_mv_kind(w: &crate::GpuWeight) -> (QuantFormat, MvKind) {
 /// slice one token's row out of a T-wide activation buffer want
 /// `record_gemma_mv_off`.
 ///
-/// Deliberately NOT a thin wrapper over `record_gemma_mv_off`. This is the
-/// GPU-resident DECODE hot path (7 projections x every layer, every token) and
-/// `record_to` binds through fixed-size stack arrays, while `record_to_off`
-/// heap-allocates two `Vec`s per dispatch — the exact allocation churn
-/// `record_to` was rewritten to remove. The offset form pays that only on the
-/// batched-verify LM head (T <= 8 dispatches per call).
+/// Kept separate from `record_gemma_mv_off` so the GPU-resident DECODE hot path
+/// (7 projections x every layer, every token) calls `record_to` directly
+/// instead of building `(buffer, 0)` pairs. Both entry points share
+/// `record_dispatch_to` and use stack descriptor storage, so neither allocates
+/// per dispatch.
 pub(crate) unsafe fn record_gemma_mv(
     eng: &mut compute::ComputeEngine,
     cb: ash::vk::CommandBuffer,

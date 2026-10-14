@@ -11,9 +11,10 @@ execution graph. It starts from fork `main` at `fbccc82a49bf5e3a08ea41e62b5e92ac
   rows use constant shifts and masks automatically. Other formats keep their
   original unpacking math. Both paths retain separate FP32 affine operations
   and the original FP16 rounding before conversion back to FP32.
-- **Allocation-free offset descriptors.** `record_to_off` uses bounded stack
-  arrays, matching `record_to`, rather than allocating two vectors per dispatch.
-  Excess bindings return an error before consuming a descriptor set.
+- **Allocation-free shared dispatch recording.** `record_to` and `record_to_off`
+  share descriptor setup and command recording through an iterator-based helper.
+  Both use bounded stack arrays; offset dispatches no longer allocate two vectors.
+  Both reject excess bindings before consuming a descriptor set.
 - **Device capabilities drive shader availability.** Query and enable supported
   integer arithmetic, integer-dot and narrow-storage features. Inspect SPIR-V
   capabilities and subgroup operand/result types before startup, eager and
@@ -81,8 +82,9 @@ CPU tests cover rounding boundaries, signed zeros, subnormals, overflow,
 non-finite coefficients and multiple bit widths/group sizes. Capability tests
 cover missing features, storage-only FP16, malformed modules and unaligned
 byte slices. GPU tests compare the existing quantized kernels against CPU
-references and exercise aligned offset descriptors, in-place updates, untouched
-neighboring slices and a valid dispatch after rejecting excess bindings.
+references and exercise both zero-offset entry points, aligned offset descriptors,
+in-place updates, untouched neighboring slices and a valid dispatch after rejecting
+excess bindings through either entry point.
 GEMM selection tests cover missing preferred pipelines and preservation of
 available geometries. GPU tests disable FP16 arithmetic in the cache's
 capabilities and execute the selected FP32 fallback across partial tiles,

@@ -758,7 +758,7 @@ fn every_matvec_kernel_is_covered_or_excused() {
 
 
 #[test]
-fn offset_descriptors_preserve_slices_and_recover_after_invalid_bindings() {
+fn dispatch_descriptors_preserve_slices_and_recover_after_invalid_bindings() {
     let Some((mut engine, _fp16, _sg, alignment)) = engine_or_skip() else {
         return;
     };
@@ -772,58 +772,65 @@ fn offset_descriptors_preserve_slices_and_recover_after_invalid_bindings() {
     let output = engine.alloc_device(a.size).unwrap();
     engine.upload(&a, &f32_bytes(&a_values)).unwrap();
     engine.upload(&b, &f32_bytes(&b_values)).unwrap();
-    engine.upload(&output, &f32_bytes(&untouched)).unwrap();
     let pc = crate::push_constants::ew_mul_pc(n as u32);
-    let cb = engine.begin_batch().unwrap();
-    let too_many = vec![(&a, alignment); crate::pipeline::MAX_BINDINGS as usize + 1];
-    assert!(engine
-        .record_to_off(cb, "add_f32_f32_f32", &too_many, &pc, (1, 1, 1))
-        .unwrap_err()
-        .contains("MAX_BINDINGS"));
-    // Continue the same live recording after rejection, without resetting it.
-    engine
-        .record_to_off(
-            cb,
-            "add_f32_f32_f32",
-            &[
-                (&a, alignment),
-                (&b, alignment),
-                (&output, alignment),
-                (&output, alignment),
-            ],
-            &pc,
-            (1, 1, 1),
-        )
-        .unwrap();
-    engine.record_barrier_to(cb);
-    engine
-        .record_to_off(
-            cb,
-            "add_f32_f32_f32",
-            &[
-                (&output, alignment),
-                (&b, alignment),
-                (&output, alignment),
-                (&output, alignment),
-            ],
-            &pc,
-            (1, 1, 1),
-        )
-        .unwrap();
-    engine.submit_batch(cb).unwrap();
-    let mut bytes = Vec::new();
-    engine.download(&output, &mut bytes).unwrap();
-    let actual: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
-        .collect();
-    for i in 0..actual.len() {
-        let expected = if (prefix..prefix + n).contains(&i) {
-            a_values[i] + b_values[i] + b_values[i]
+    // Compare both zero-offset entry points, then exercise a nonzero slice.
+    for (use_offsets, offset) in [(false, 0), (true, 0), (true, alignment)] {
+        engine.upload(&output, &f32_bytes(&untouched)).unwrap();
+        let cb = engine.begin_batch().unwrap();
+        let binding_count = crate::pipeline::MAX_BINDINGS as usize + 1;
+        let caller = if use_offsets { "record_to_off" } else { "record_to" };
+        let error = if use_offsets {
+            let too_many = vec![(&a, offset); binding_count];
+            engine
+                .record_to_off(cb, "add_f32_f32_f32", &too_many, &pc, (1, 1, 1))
+                .unwrap_err()
         } else {
-            untouched[i]
+            let too_many = vec![&a; binding_count];
+            engine
+                .record_to(cb, "add_f32_f32_f32", &too_many, &pc, (1, 1, 1))
+                .unwrap_err()
         };
-        assert_eq!(actual[i].to_bits(), expected.to_bits(), "element{i}");
+        assert!(error.starts_with(&format!("{caller}:")), "{error}");
+        assert!(error.contains("MAX_BINDINGS"), "{error}");
+
+        // Continue the same live recording after rejection, without resetting it.
+        let record_add = |engine: &mut ComputeEngine, lhs: &Buffer| {
+            let buffers = [lhs, &b, &output, &output];
+            if use_offsets {
+                engine.record_to_off(
+                    cb,
+                    "add_f32_f32_f32",
+                    &buffers.map(|b| (b, offset)),
+                    &pc,
+                    (1, 1, 1),
+                )
+            } else {
+                engine.record_to(cb, "add_f32_f32_f32", &buffers, &pc, (1, 1, 1))
+            }
+        };
+        record_add(&mut engine, &a).unwrap();
+        engine.record_barrier_to(cb);
+        record_add(&mut engine, &output).unwrap();
+        engine.submit_batch(cb).unwrap();
+        let mut bytes = Vec::new();
+        engine.download(&output, &mut bytes).unwrap();
+        let actual: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        let start = (offset / 4) as usize;
+        for i in 0..actual.len() {
+            let expected = if (start..start + n).contains(&i) {
+                a_values[i] + b_values[i] + b_values[i]
+            } else {
+                untouched[i]
+            };
+            assert_eq!(
+                actual[i].to_bits(),
+                expected.to_bits(),
+                "{caller}, offset={offset}, element={i}",
+            );
+        }
     }
 }
 
