@@ -16,7 +16,7 @@ use crate::{
     matvec_mlx4_variant_k,
     nvfp4_dispatch, matvec_fp8_variant, matvec_fp8_pc, matvec_f32_variant,
     matvec_f32_variant_k,
-    gemm_pc, gemm_variant_k, gemm_pc_mlx4, gemm_pc_mlx4_id, gemm_pc_mlx4_id_gateup,
+    gemm_pc, gemm_variant_k_available, gemm_pc_mlx4, gemm_pc_mlx4_id, gemm_pc_mlx4_id_gateup,
     gemm_variant_quant_k, gemm_variant_quant_id_bn, gemm_quant_flag,
     ew_unary_pc, ew_mul_pc, rmsnorm_pc, rope_neox_pc,
     q35_conv_pc, q35_qknorm_pc, q35_gdn_pc, q35_gdn_scan_pc, q35_moe_accum_pc,
@@ -348,9 +348,9 @@ impl VulkanModel {
     /// CPU elementwise path). x is [t,h]; returns [t,h]. Falls back to CPU.
     pub(crate) fn qwen_ffn_gpu(&mut self, x: &[f32], gate_name: &str, up_name: &str, down_name: &str,
                     t: usize, h: usize, inter: usize) -> Vec<f32> {
-        let gw = self.gpu_weights.get(gate_name).map(|w| &w.buffer as *const compute::Buffer);
-        let uw = self.gpu_weights.get(up_name).map(|w| &w.buffer as *const compute::Buffer);
-        let dw = self.gpu_weights.get(down_name).map(|w| &w.buffer as *const compute::Buffer);
+        let f16_buffer = |name: &str| self.gpu_weights.get(name)
+            .and_then(|w| w.f16_gemm_buffer()).map(|buffer| buffer as *const compute::Buffer);
+        let (gw, uw, dw) = (f16_buffer(gate_name), f16_buffer(up_name), f16_buffer(down_name));
         if let (Some(eng), Some(gw), Some(uw), Some(dw)) = (self.engine.as_mut(), gw, uw, dw) {
             let a = |eng: &mut compute::ComputeEngine, sz: usize| eng.alloc_host_coherent_storage((sz * 4) as u64).unwrap();
             let ffi = a(eng, t * h); ffi.write(&f32_slice_to_bytes(x)).unwrap();
@@ -369,8 +369,8 @@ impl VulkanModel {
             // (K,N) shapes -- see gemm_variant_k.
             let gpc = gemm_pc(t, inter, h);   // gate/up: N=inter, K=h
             let dpc = gemm_pc(t, h, inter);   // down:    N=h,     K=inter
-            let (g_variant, g_bm, g_bn) = gemm_variant_k(h, inter);
-            let (d_variant, d_bm, d_bn) = gemm_variant_k(inter, h);
+            let (g_variant, g_bm, g_bn) = gemm_variant_k_available(h, inter, |name| eng.has_pipeline(name));
+            let (d_variant, d_bm, d_bn) = gemm_variant_k_available(inter, h, |name| eng.has_pipeline(name));
             let gwg = (((inter + g_bm as usize - 1) / g_bm as usize) as u32,
                        ((t + g_bn as usize - 1) / g_bn as usize) as u32, 1u32);
             let dwg = (((h + d_bm as usize - 1) / d_bm as usize) as u32,
@@ -391,11 +391,11 @@ impl VulkanModel {
             for b in [ffi, gp, sp, up, mid, down] { eng.return_to_pool(b); }
             out
         } else {
-            let gate = model::cpu_matmul(x, self.qwen.as_ref().unwrap().weights.f32_slice(gate_name), t, h, inter);
-            let up = model::cpu_matmul(x, self.qwen.as_ref().unwrap().weights.f32_slice(up_name), t, h, inter);
+            let gate = self.gemm_fallback(gate_name, x, t, h, inter);
+            let up = self.gemm_fallback(up_name, x, t, h, inter);
             let act = model::cpu_silu(&gate);
             let mid: Vec<f32> = act.iter().zip(up.iter()).map(|(&g, &u)| g * u).collect();
-            model::cpu_matmul(&mid, self.qwen.as_ref().unwrap().weights.f32_slice(down_name), t, inter, h)
+            self.gemm_fallback(down_name, &mid, t, inter, h)
         }
     }
     /// GPU RMSNorm with weight: out[r,c] = x[r,c] * rsqrt(mean(x[r]^2)+eps) * w[c].
@@ -2577,10 +2577,8 @@ impl VulkanModel {
                 return out;
             }
         }
-        let (variant, bm, bn) = gemm_variant_k(k, n);
-        let (bm, bn) = (bm as usize, bn as usize);
         // The `matmul_f16_f32_*` GEMM family only knows how to read a PLAIN
-        // f16/f32 weight buffer — no batched-T GEMM variant exists for
+        // f16 weight buffer — no batched-T GEMM variant exists here for
         // Q8_0/Nvfp4/Fp8-resident weights (unlike `qwen35_matvec`, which picks
         // the correct dequantizing shader per `format`/`aux`). A real load with
         // `VLLM_VULKAN_QUANT=q8_0` or an NVFP4/FP8 checkpoint would otherwise
@@ -2590,9 +2588,10 @@ impl VulkanModel {
         // chunked-lm_head / f16-host / f32-host sources) for everything else —
         // correct for every real loader configuration, just not batched.
         let plain_gpu = self.gpu_weights.get(weight_name)
-            .filter(|w| w.aux.is_none() && matches!(w.format, crate::flags::QuantFormat::F16 | crate::flags::QuantFormat::F32))
-            .map(|w| &w.buffer as *const compute::Buffer);
+            .and_then(|w| w.f16_gemm_buffer()).map(|buffer| buffer as *const compute::Buffer);
         if let (Some(eng), Some(w_ptr)) = (self.engine.as_mut(), plain_gpu) {
+            let (variant, bm, bn) = gemm_variant_k_available(k, n, |name| eng.has_pipeline(name));
+            let (bm, bn) = (bm as usize, bn as usize);
             let xb = f32_slice_to_bytes(x);
             let inp = eng.alloc_host_coherent_storage((t * k * 4) as u64).unwrap();
             inp.write(&xb).unwrap();

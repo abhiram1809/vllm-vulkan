@@ -260,6 +260,19 @@ pub(crate) fn gemm_variant_k(k: usize, n: usize) -> (String, u32, u32) {
     (LEGACY.to_string(), LEGACY_BM, LEGACY_BN)
 }
 
+/// Use the preferred GEMM only when it survived device capability filtering.
+/// The FP32 fallback has its own 64×64 tiles, independent of the preferred geometry.
+pub(crate) fn gemm_variant_k_available(
+    k: usize, n: usize, has_pipeline: impl FnOnce(&str) -> bool,
+) -> (String, u32, u32) {
+    let preferred = gemm_variant_k(k, n);
+    if has_pipeline(&preferred.0) {
+        preferred
+    } else {
+        ("matmul_f16_f32_fp32".to_string(), 64, 64)
+    }
+}
+
 /// Pure core of `matvec_shader`: pick the scalar/subgroup, f16/f32 base shader.
 pub(crate) fn matvec_shader_core(f16_weight: bool, use_sg: bool) -> &'static str {
     match (f16_weight, use_sg) {
@@ -2813,6 +2826,19 @@ mod dispatch_tests {
         assert_eq!(gemm_pick(5120, 5120), None); // 27B dense hidden (not yet swept)
         assert_eq!(gemm_variant_k(2048, 1024),
                    ("matmul_f16_f32_fp32".to_string(), 64, 64));
+    }
+
+    /// Filtering FP16 arithmetic must select the FP32 kernel and its matching tiles.
+    #[test]
+    fn gemm_picker_falls_back_when_preferred_pipeline_is_unavailable() {
+        for (k, n) in [(2048, 8192), (4096, 2048), (2048, 512), (1536, 4096)] {
+            assert_eq!(
+                gemm_variant_k_available(k, n, |name| name == "matmul_f16_f32_fp32"),
+                ("matmul_f16_f32_fp32".to_string(), 64, 64),
+                "shape ({k}, {n})"
+            );
+            assert_eq!(gemm_variant_k_available(k, n, |_| true), gemm_variant_k(k, n));
+        }
     }
 
     #[test]

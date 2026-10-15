@@ -619,10 +619,17 @@ fn sweep(engine: &mut ComputeEngine, fp16: bool) -> Report {
 
 // ─── tests ───────────────────────────────────────────────────────────────────
 
-/// Build a `ComputeEngine` on device 0, or `None` when the machine has no
+/// Build a `ComputeEngine` on VLLM_VULKAN_TEST_DEVICE (default 0), or `None` when the machine has no
 /// Vulkan ICD (the default CI job). This is the single place the whole module
 /// no-ops through.
-fn engine_or_skip() -> Option<(ComputeEngine, bool, u32)> {
+fn engine_or_skip() -> Option<(ComputeEngine, bool, u32, u64)> {
+    engine_or_skip_with_caps(|_| {})
+}
+
+/// Adjust advertised capabilities to exercise optional-feature filtering on real GPUs.
+fn engine_or_skip_with_caps(
+    adjust_caps: impl FnOnce(&mut device::DeviceCaps),
+) -> Option<(ComputeEngine, bool, u32, u64)> {
     if !device::is_vulkan_available() {
         eprintln!(
             "device_conformance: no Vulkan device (no ICD) — GPU conformance SKIPPED. \
@@ -631,29 +638,36 @@ fn engine_or_skip() -> Option<(ComputeEngine, bool, u32)> {
         );
         return None;
     }
-    let dev = device::ComputeDevice::create(0).expect("Vulkan reported available but device 0 failed to create");
+    let device_idx = std::env::var("VLLM_VULKAN_TEST_DEVICE").unwrap_or_else(|_| "0".into())
+        .parse::<usize>().expect("VLLM_VULKAN_TEST_DEVICE must be a nonnegative device index");
+    let dev = device::ComputeDevice::create(device_idx)
+        .expect("Vulkan reported available but selected test device failed to create");
     let (fp16, subgroup) = (dev.fp16, dev.subgroup_size);
+    let alignment = unsafe { dev.instance.get_physical_device_properties(dev.physical_device) }
+        .limits.min_storage_buffer_offset_alignment.max(4);
     let spvs = include_all_shaders();
     let refs: std::collections::HashMap<&str, &[u8]> =
         spvs.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+    let mut caps = dev.caps();
+    adjust_caps(&mut caps);
     let engine = ComputeEngine::new(
         dev.instance.clone(),
         dev.physical_device,
         dev.device.clone(),
         dev.compute_queue,
         dev.compute_queue_family,
-        dev.caps(),
+        caps,
         &refs,
     )
     .expect("ComputeEngine::new failed on an available device");
-    Some((engine, fp16, subgroup))
+    Some((engine, fp16, subgroup, alignment))
 }
 
 /// Every quant matvec kernel this branch ships, run for real against the CPU
 /// dequant reference. No-ops (PASS) with no device.
 #[test]
 fn quant_matvec_kernels_match_cpu_reference() {
-    let Some((mut engine, fp16, subgroup)) = engine_or_skip() else { return };
+    let Some((mut engine, fp16, subgroup, _alignment)) = engine_or_skip() else { return };
     eprintln!("device_conformance: subgroup_size={subgroup} fp16={fp16} k={K} n={N} tol={TOL:e}");
 
     let report = sweep(&mut engine, fp16);
@@ -690,7 +704,7 @@ fn quant_matvec_kernels_match_cpu_reference() {
 /// every other assertion in this file is worthless.
 #[test]
 fn harness_detects_a_corrupted_reference() {
-    let Some((mut engine, _fp16, _sg)) = engine_or_skip() else { return };
+    let Some((mut engine, _fp16, _sg, _alignment)) = engine_or_skip() else { return };
     const NAME: &str = "mul_mat_vec_mlx4_f32_f32";
     if !engine.has_pipeline(NAME) {
         eprintln!("device_conformance: {NAME} not compiled here — fail-injection SKIPPED");
@@ -740,4 +754,368 @@ fn every_matvec_kernel_is_covered_or_excused() {
          line saying why a numerical check is not possible.",
         uncovered.len()
     );
+}
+
+
+#[test]
+fn dispatch_descriptors_preserve_slices_and_recover_after_invalid_bindings() {
+    let Some((mut engine, _fp16, _sg, alignment)) = engine_or_skip() else {
+        return;
+    };
+    let prefix = (alignment / 4) as usize;
+    let n = 32usize;
+    let a_values: Vec<f32> = (0..prefix + n + prefix).map(|i| i as f32).collect();
+    let b_values: Vec<f32> = a_values.iter().map(|v| v * 2.0).collect();
+    let untouched = vec![-17.0f32; a_values.len()];
+    let a = engine.alloc_device((a_values.len() * 4) as u64).unwrap();
+    let b = engine.alloc_device(a.size).unwrap();
+    let output = engine.alloc_device(a.size).unwrap();
+    engine.upload(&a, &f32_bytes(&a_values)).unwrap();
+    engine.upload(&b, &f32_bytes(&b_values)).unwrap();
+    let pc = crate::push_constants::ew_mul_pc(n as u32);
+    // Compare both zero-offset entry points, then exercise a nonzero slice.
+    for (use_offsets, offset) in [(false, 0), (true, 0), (true, alignment)] {
+        engine.upload(&output, &f32_bytes(&untouched)).unwrap();
+        let cb = engine.begin_batch().unwrap();
+        let binding_count = crate::pipeline::MAX_BINDINGS as usize + 1;
+        let caller = if use_offsets { "record_to_off" } else { "record_to" };
+        let error = if use_offsets {
+            let too_many = vec![(&a, offset); binding_count];
+            engine
+                .record_to_off(cb, "add_f32_f32_f32", &too_many, &pc, (1, 1, 1))
+                .unwrap_err()
+        } else {
+            let too_many = vec![&a; binding_count];
+            engine
+                .record_to(cb, "add_f32_f32_f32", &too_many, &pc, (1, 1, 1))
+                .unwrap_err()
+        };
+        assert!(error.starts_with(&format!("{caller}:")), "{error}");
+        assert!(error.contains("MAX_BINDINGS"), "{error}");
+
+        // Continue the same live recording after rejection, without resetting it.
+        let record_add = |engine: &mut ComputeEngine, lhs: &Buffer| {
+            let buffers = [lhs, &b, &output, &output];
+            if use_offsets {
+                engine.record_to_off(
+                    cb,
+                    "add_f32_f32_f32",
+                    &buffers.map(|b| (b, offset)),
+                    &pc,
+                    (1, 1, 1),
+                )
+            } else {
+                engine.record_to(cb, "add_f32_f32_f32", &buffers, &pc, (1, 1, 1))
+            }
+        };
+        record_add(&mut engine, &a).unwrap();
+        engine.record_barrier_to(cb);
+        record_add(&mut engine, &output).unwrap();
+        engine.submit_batch(cb).unwrap();
+        let mut bytes = Vec::new();
+        engine.download(&output, &mut bytes).unwrap();
+        let actual: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        let start = (offset / 4) as usize;
+        for i in 0..actual.len() {
+            let expected = if (start..start + n).contains(&i) {
+                a_values[i] + b_values[i] + b_values[i]
+            } else {
+                untouched[i]
+            };
+            assert_eq!(
+                actual[i].to_bits(),
+                expected.to_bits(),
+                "{caller}, offset={offset}, element={i}",
+            );
+        }
+    }
+}
+
+
+#[test]
+fn unsupported_shader_variants_are_rejected_before_compilation() {
+    let Some((mut engine, fp16, _sg, _alignment)) = engine_or_skip() else { return };
+    if fp16 { return; }
+    let shaders = include_all_shaders();
+    let shader = &shaders["matmul_f16_f32_f16_aligned"];
+    let message = engine.compile_extra_variant("unsupported_f16_eager", shader, &[]).unwrap_err();
+    assert!(message.contains("requires unavailable feature"));
+    let message = engine.compile_variant_timeout("unsupported_f16_timeout", shader, &[], 1000).unwrap_err();
+    assert!(message.contains("requires unavailable feature"));
+    assert!(!engine.has_pipeline("unsupported_f16_eager"));
+    assert!(!engine.has_pipeline("unsupported_f16_timeout"));
+}
+
+/// Simulate a missing subgroup feature at startup and in both variant compilers.
+#[test]
+fn disabled_subgroup_extended_types_skip_attention_and_reject_variants() {
+    let Some((mut engine, fp16, _sg, _alignment)) =
+        engine_or_skip_with_caps(|caps| caps.shader_subgroup_extended_types = false)
+    else { return };
+    if !fp16 {
+        eprintln!("subgroup feature isolation SKIPPED: device lacks FP16 arithmetic/storage");
+        return;
+    }
+    let name = "flash_attn_f32_f16_f32_f16acc";
+    assert!(!engine.has_pipeline(name));
+    assert!(engine.has_pipeline("flash_attn_f32_f16_f32_fp32"));
+    let shaders = include_all_shaders();
+    let shader = &shaders[name];
+    let message = engine.compile_extra_variant("unsupported_subgroup_eager", shader, &[]).unwrap_err();
+    assert!(message.contains("shaderSubgroupExtendedTypes"));
+    let message = engine.compile_variant_timeout("unsupported_subgroup_timeout", shader, &[], 1000).unwrap_err();
+    assert!(message.contains("shaderSubgroupExtendedTypes"));
+    assert!(!engine.has_pipeline("unsupported_subgroup_eager"));
+    assert!(!engine.has_pipeline("unsupported_subgroup_timeout"));
+}
+
+/// Select and dispatch the FP32 fallback after filtering all FP16 arithmetic pipelines.
+#[test]
+fn gemm_selection_without_fp16_arithmetic_uses_supported_tiles() {
+    let Some((mut engine, _fp16, _sg, _alignment)) =
+        engine_or_skip_with_caps(|caps| caps.shader_float16 = false)
+    else { return };
+    if !engine.has_pipeline("matmul_f16_f32_fp32") {
+        eprintln!("GEMM fallback dispatch SKIPPED: device lacks FP16 storage");
+        return;
+    }
+    assert!(!engine.has_pipeline("matmul_f16_f32_f16_aligned"));
+    // This shape normally selects a 64×32 FP16 arithmetic geometry sibling.
+    let (variant, bm, bn) = crate::push_constants::gemm_variant_k_available(
+        2048, 8192, |name| engine.has_pipeline(name),
+    );
+    assert_eq!((variant.as_str(), bm, bn), ("matmul_f16_f32_fp32", 64, 64));
+
+    // The fallback is shape-independent. Exercise partial row/column tiles
+    // with small buffers, using the selected kernel and its returned geometry.
+    let (t, n, k) = (65usize, 96usize, 128usize);
+    let weights: Vec<f32> = (0..n).flat_map(|r| {
+        std::iter::repeat_n(((r % 9) as i32 - 4) as f32 * 0.125, k)
+    }).collect();
+    let input: Vec<f32> = (0..t).flat_map(|token| {
+        (0..k).map(move |j| ((j + token) % 17) as f32 * 0.125)
+    }).collect();
+    let weight_bytes: Vec<u8> = weights.iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes()).collect();
+    let w = engine.alloc_host_coherent_storage(weight_bytes.len() as u64).unwrap();
+    let x = engine.alloc_host_coherent_storage((input.len() * 4) as u64).unwrap();
+    let out = engine.alloc_host_coherent_storage((t * n * 4) as u64).unwrap();
+    w.write(&weight_bytes).unwrap();
+    x.write(&f32_bytes(&input)).unwrap();
+    out.write(&f32_bytes(&vec![-1.0e9; t * n])).unwrap();
+    let cb = engine.begin_batch().unwrap();
+    engine.record_to(
+        cb, &variant, &[&w, &x, &out], &crate::push_constants::gemm_pc(t, n, k),
+        (n.div_ceil(bm as usize) as u32, t.div_ceil(bn as usize) as u32, 1),
+    ).unwrap();
+    engine.submit_batch(cb).unwrap();
+    let mut bytes = vec![0; out.size as usize];
+    out.read(&mut bytes).unwrap();
+    for token in 0..t {
+        for row in 0..n {
+            let expected: f32 = input[token * k..(token + 1) * k].iter()
+                .zip(&weights[row * k..(row + 1) * k]).map(|(x, w)| x * w).sum();
+            let offset = (token * n + row) * 4;
+            let actual = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            assert_eq!(actual, expected, "token {token}, row {row}");
+        }
+    }
+}
+
+/// Read shader output and copied snapshots directly after sync, async and ring waits.
+#[test]
+fn batch_snapshot_copies_are_visible_to_host() {
+    let Some((mut engine, _fp16, _sg, _alignment)) = engine_or_skip() else { return };
+    let n = 32usize;
+    let source = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+    let computed = engine.alloc_host_coherent_storage(source.size).unwrap();
+    let snapshot = engine.alloc_host_coherent_storage(source.size + 8).unwrap();
+    let copied = engine.alloc_host_coherent_storage(source.size).unwrap();
+    for mode in 0..if engine.ring_active() { 3 } else { 2 } {
+        let values: Vec<f32> = (0..n).map(|i| i as f32 + mode as f32).collect();
+        source.write(&f32_bytes(&values)).unwrap();
+        computed.write(&vec![0; computed.size as usize]).unwrap();
+        snapshot.write(&vec![0xa5; snapshot.size as usize]).unwrap();
+        copied.write(&vec![0; copied.size as usize]).unwrap();
+        let cb = if mode == 2 {
+            engine.begin_forward_ring().unwrap();
+            engine.begin_batch_pipelined().unwrap()
+        } else { engine.begin_batch().unwrap() };
+        engine.record_to(
+            cb, "add_f32_f32_f32", &[&source, &source, &computed, &computed],
+            &crate::push_constants::ew_mul_pc(n as u32), (1, 1, 1),
+        ).unwrap();
+        engine.record_compute_to_transfer_barrier(cb);
+        engine.record_copy_to(cb, &computed, &snapshot, 0, 4, computed.size);
+        // Also exercise a transfer-only destination that has no shader writes.
+        engine.record_copy_to(cb, &source, &copied, 0, 0, source.size);
+        match mode {
+            0 => engine.submit_batch(cb).unwrap(),
+            1 => {
+                engine.submit_batch_async(cb).unwrap();
+                engine.wait_batch().unwrap();
+            }
+            _ => {
+                engine.submit_batch_pipelined(cb, Vec::new()).unwrap();
+                engine.wait_batch_pipelined().unwrap();
+            }
+        }
+        let expected = f32_bytes(&values.iter().map(|v| v + v).collect::<Vec<_>>());
+        let mut bytes = vec![0; computed.size as usize];
+        computed.read(&mut bytes).unwrap();
+        assert_eq!(bytes, expected, "direct shader read, mode {mode}");
+        copied.read(&mut bytes).unwrap();
+        assert_eq!(bytes, f32_bytes(&values), "transfer-only read, mode {mode}");
+        bytes.resize(snapshot.size as usize, 0);
+        snapshot.read(&mut bytes).unwrap();
+        assert_eq!(&bytes[4..4 + expected.len()], expected, "snapshot read, mode {mode}");
+        assert_eq!(&bytes[..4], &[0xa5; 4]);
+        assert_eq!(&bytes[4 + expected.len()..], &[0xa5; 4]);
+    }
+}
+
+/// Wrong-format resident buffers must never reach an F16 GEMM; plain F16 still does.
+#[cfg(feature = "gemma")]
+#[test]
+fn gemm_format_guards_preserve_cpu_results_and_plain_f16_dispatch() {
+    let Some((engine, _fp16, _sg, _alignment)) =
+        engine_or_skip_with_caps(|caps| caps.shader_float16 = false)
+    else { return };
+    if !engine.has_pipeline("matmul_f16_f32_fp32") { return; }
+    let mut m = crate::batched_forward_tests::tiny_qwen_model();
+    m.engine = Some(engine);
+    let (t, k, n) = (2, 128, 16);
+    let name = "format_guard.weight";
+    let weights = vec![0.125; n * k];
+    let input: Vec<f32> = (0..t * k).map(|i| (i % 17) as f32 * 0.125).collect();
+    m.qwen.as_mut().unwrap().weights.tensors.insert(name.into(), model::SimpleTensor {
+        data: weights.clone(), shape: vec![n, k],
+    });
+    let expected = model::cpu_matmul(&input, &weights, t, k, n);
+    for format in [crate::QuantFormat::Q4_0, crate::QuantFormat::Q4_K,
+        crate::QuantFormat::Q8_0, crate::QuantFormat::Bf16, crate::QuantFormat::F32,
+        crate::QuantFormat::Mlx4, crate::QuantFormat::Nvfp4, crate::QuantFormat::Fp8] {
+        // Padding makes an accidental F16 bind safe to execute, but its NaN
+        // payload cannot produce the finite CPU answer.
+        let buffer = m.engine.as_mut().unwrap().alloc_host_coherent_storage((n * k * 2) as u64).unwrap();
+        buffer.write(&vec![0xff; n * k * 2]).unwrap();
+        m.gpu_weights.insert(name.into(), crate::GpuWeight { buffer, format, aux: None });
+        assert_eq!(m.gpu_gemm(name, &input, t, k, n), expected, "{format:?}");
+    }
+    let engine = m.engine.as_mut().unwrap();
+    let buffer = engine.alloc_host_coherent_storage((n * k * 2) as u64).unwrap();
+    buffer.write(&vec![0xff; n * k * 2]).unwrap();
+    let scale = engine.alloc_host_coherent_storage(4).unwrap();
+    scale.write(&1.0f32.to_le_bytes()).unwrap();
+    m.gpu_weights.insert(name.into(), crate::GpuWeight {
+        buffer, format: crate::QuantFormat::F16,
+        aux: Some(crate::QuantAux::Fp8 { scale, per_row: false }),
+    });
+    assert_eq!(m.gpu_gemm(name, &input, t, k, n), expected, "F16 with auxiliary metadata");
+    let resident = vec![0.25; n * k];
+    let bytes: Vec<u8> = resident.iter().flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes()).collect();
+    let buffer = m.engine.as_mut().unwrap().alloc_host_coherent_storage(bytes.len() as u64).unwrap();
+    buffer.write(&bytes).unwrap();
+    m.gpu_weights.insert(name.into(), crate::GpuWeight { buffer, format: crate::QuantFormat::F16, aux: None });
+    let gpu_expected = model::cpu_matmul(&input, &resident, t, k, n);
+    assert_ne!(gpu_expected, expected);
+    assert_eq!(m.gpu_gemm(name, &input, t, k, n), gpu_expected);
+}
+
+/// Any incompatible gate/up/down weight must prevent the fused F16 FFN dispatch.
+#[cfg(feature = "gemma")]
+#[test]
+fn fused_ffn_format_guard_checks_each_weight() {
+    let Some((engine, _fp16, _sg, _alignment)) =
+        engine_or_skip_with_caps(|caps| caps.shader_float16 = false)
+    else { return };
+    let mut m = crate::batched_forward_tests::tiny_qwen_model();
+    m.engine = Some(engine);
+    let (t, h, inter) = (2, 32, 32);
+    let names = ["guard.gate", "guard.up", "guard.down"];
+    let weights: Vec<f32> = (0..h * inter).map(|i| ((i % 7) as i32 - 3) as f32 * 0.015625).collect();
+    for name in names {
+        m.qwen.as_mut().unwrap().weights.tensors.insert(name.into(), model::SimpleTensor {
+            data: weights.clone(), shape: vec![h, inter],
+        });
+    }
+    let input: Vec<f32> = (0..t * h).map(|i| (i % 13) as f32 * 0.03125).collect();
+    let gate = model::cpu_matmul(&input, &weights, t, h, inter);
+    let act = model::cpu_silu(&gate);
+    let mid: Vec<f32> = act.iter().zip(&gate).map(|(a, u)| a * u).collect();
+    let expected = model::cpu_matmul(&mid, &weights, t, inter, h);
+    let f16: Vec<u8> = weights.iter().flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes()).collect();
+    let poison = vec![0xff; f16.len()];
+    for format in [crate::QuantFormat::Q4_0, crate::QuantFormat::Q4_K,
+        crate::QuantFormat::Q8_0, crate::QuantFormat::Bf16, crate::QuantFormat::F32] {
+        for incompatible in 0..3 {
+            for (slot, name) in names.iter().enumerate() {
+                let buffer = m.engine.as_mut().unwrap().alloc_host_coherent_storage(f16.len() as u64).unwrap();
+                buffer.write(if slot == incompatible { &poison } else { &f16 }).unwrap();
+                m.gpu_weights.insert((*name).into(), crate::GpuWeight {
+                    buffer, format: if slot == incompatible { format } else { crate::QuantFormat::F16 }, aux: None,
+                });
+            }
+            assert_eq!(m.qwen_ffn_gpu(&input, names[0], names[1], names[2], t, h, inter),
+                expected, "{format:?} at slot {incompatible}");
+        }
+    }
+}
+
+/// Lean-host models must still decode resident Q4/Q8/BF16/F32 weights correctly.
+#[cfg(feature = "gemma")]
+#[test]
+fn gemm_format_fallback_handles_lean_host_weights() {
+    let Some((engine, _fp16, _sg, _alignment)) = engine_or_skip() else { return };
+    let mut m = crate::batched_forward_tests::tiny_qwen_model();
+    m.engine = Some(engine);
+    let (t, k, n) = (2, 256, 16);
+    let name = "lean_guard.weight";
+    let weights: Vec<f32> = (0..n * k).map(|i| ((i % 19) as i32 - 9) as f32 * 0.03125).collect();
+    let input: Vec<f32> = (0..t * k).map(|i| ((i % 17) as i32 - 8) as f32 * 0.0625).collect();
+    for format in [crate::QuantFormat::Q4_0, crate::QuantFormat::Q4_K,
+        crate::QuantFormat::Q8_0, crate::QuantFormat::Bf16, crate::QuantFormat::F32] {
+        let (bytes, decoded) = match format {
+            crate::QuantFormat::Q4_0 => { let b = model::quantize_q4_0(&weights); let d = model::dequant_q4_0_to_f32(&b); (b, d) },
+            crate::QuantFormat::Q4_K => { let b = model::quantize_q4_k(&weights); let d = model::dequant_q4_k_to_f32(&b); (b, d) },
+            crate::QuantFormat::Q8_0 => { let b = model::quantize_q8_0(&weights); let d = model::dequant_q8_0_to_f32(&b); (b, d) },
+            crate::QuantFormat::Bf16 => {
+                let d: Vec<f32> = weights.iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect();
+                let b = d.iter().flat_map(|&v| half::bf16::from_f32(v).to_bits().to_le_bytes()).collect();
+                (b, d)
+            },
+            _ => (f32_bytes(&weights), weights.clone()),
+        };
+        let buffer = m.engine.as_mut().unwrap().alloc_host_coherent_storage(bytes.len() as u64).unwrap();
+        buffer.write(&bytes).unwrap();
+        m.gpu_weights.insert(name.into(), crate::GpuWeight { buffer, format, aux: None });
+        assert!(!m.qwen.as_ref().unwrap().weights.contains(name));
+        let actual = m.gpu_gemm(name, &input, t, k, n);
+        let expected = model::cpu_matmul(&input, &decoded, t, k, n);
+        for (i, (&a, &e)) in actual.iter().zip(&expected).enumerate() {
+            assert!((a - e).abs() <= 1e-5 * (1.0 + e.abs()), "{format:?} output {i}: {a} vs {e}");
+        }
+        assert_eq!(actual.len(), expected.len());
+    }
+}
+
+/// F32 residency must use the format-aware Qwen3.5 route instead of an F16 GEMM.
+#[cfg(feature = "qwen35")]
+#[test]
+fn qwen35_gemm_f32_residency_is_format_aware() {
+    let Some((engine, _fp16, _sg, _alignment)) = engine_or_skip() else { return };
+    let mut m = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
+    m.engine = Some(engine);
+    let (t, k, n) = (2, 128, 16);
+    let name = "f32_guard.weight";
+    let weights: Vec<f32> = (0..n).flat_map(|r| std::iter::repeat_n(r as f32 * 0.125, k)).collect();
+    let input: Vec<f32> = (0..t * k).map(|i| (i % 17) as f32 * 0.125).collect();
+    let bytes = f32_bytes(&weights);
+    let buffer = m.engine.as_mut().unwrap().alloc_host_coherent_storage(bytes.len() as u64).unwrap();
+    buffer.write(&bytes).unwrap();
+    m.gpu_weights.insert(name.into(), crate::GpuWeight { buffer, format: crate::QuantFormat::F32, aux: None });
+    assert_eq!(m.qwen35_gemm(name, &input, t, k, n), model::cpu_matmul(&input, &weights, t, k, n));
 }

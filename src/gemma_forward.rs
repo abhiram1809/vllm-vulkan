@@ -7,9 +7,8 @@ use crate::compute;
 use crate::model;
 use crate::VulkanModel;
 use crate::{
-    matvec_pc13, matvec_shader, matvec_variant, matvec_variant_core, matvec_mlx4_pc,
+    matvec_pc13, matvec_shader, matvec_variant, matvec_variant_by_format, matvec_mlx4_pc,
     matvec_mlx4_variant_k, nvfp4_dispatch, matvec_fp8_variant, matvec_fp8_pc,
-    use_subgroup_flag, matvec_rows_override,
     f32_slice_to_bytes, read_f32_buf,
     sdpa_pc, attn_decode_kernel,
 };
@@ -55,12 +54,11 @@ pub(crate) fn gemma_res_mv_kind(w: &crate::GpuWeight) -> (QuantFormat, MvKind) {
 /// slice one token's row out of a T-wide activation buffer want
 /// `record_gemma_mv_off`.
 ///
-/// Deliberately NOT a thin wrapper over `record_gemma_mv_off`. This is the
-/// GPU-resident DECODE hot path (7 projections x every layer, every token) and
-/// `record_to` binds through fixed-size stack arrays, while `record_to_off`
-/// heap-allocates two `Vec`s per dispatch — the exact allocation churn
-/// `record_to` was rewritten to remove. The offset form pays that only on the
-/// batched-verify LM head (T <= 8 dispatches per call).
+/// Kept separate from `record_gemma_mv_off` so the GPU-resident DECODE hot path
+/// (7 projections x every layer, every token) calls `record_to` directly
+/// instead of building `(buffer, 0)` pairs. Both entry points share
+/// `record_dispatch_to` and use stack descriptor storage, so neither allocates
+/// per dispatch.
 pub(crate) unsafe fn record_gemma_mv(
     eng: &mut compute::ComputeEngine,
     cb: ash::vk::CommandBuffer,
@@ -91,7 +89,7 @@ pub(crate) unsafe fn record_gemma_mv(
             eng.record_to(cb, &shader, &[&*wptr, &*s, &*inp, &*out], &pc, (wg, 1, 1)).unwrap();
         }
         MvKind::Plain => {
-            let (shader, r) = matvec_variant_core(format, use_subgroup_flag(), true, matvec_rows_override(), n);
+            let (shader, r) = matvec_variant_by_format(format, n);
             let wg = (n as u32 + r - 1) / r;
             let pc = matvec_pc13(k, n);
             eng.record_to(cb, &shader, &[&*wptr, &*inp, &*out], &pc, (wg, 1, 1)).unwrap();
@@ -157,7 +155,7 @@ pub(crate) unsafe fn record_gemma_mv_off(
                 &pc, (wg, 1, 1)).unwrap();
         }
         MvKind::Plain => {
-            let (shader, r) = matvec_variant_core(format, use_subgroup_flag(), true, matvec_rows_override(), n);
+            let (shader, r) = matvec_variant_by_format(format, n);
             let wg = (n as u32 + r - 1) / r;
             let pc = matvec_pc13(k, n);
             eng.record_to_off(cb, &shader,
@@ -403,10 +401,9 @@ impl VulkanModel {
     }
 
     /// Row-batched projection/FFN matmul for the Gemma4 batched prefill.
-    /// `[t,k] @ W[n,k]^T -> [t,n]`. CRITICAL: `gpu_gemm` is a blind **f16-only**
-    /// tiled GEMM (A_TYPE=f16 on binding 0), which silently misinterprets the
-    /// g12b/g31b MLX-affine 4-bit / 8-bit / NVFP4 packed weights as f16 and
-    /// yields NaN. Until the quantized batched-matmul kernel lands, dispatch each
+    /// `[t,k] @ W[n,k]^T -> [t,n]`. The tiled `gpu_gemm` path accepts plain F16
+    /// weights; packed g12b/g31b MLX-affine / Q8 / NVFP4 weights use their own
+    /// formats. Until the quantized batched-matmul kernel lands, dispatch each
     /// of the T rows through the FORMAT-AWARE single-row `gemma_tp_matvec` (reads
     /// the weight's own recorded format/aux via `gemma_res_mv_kind`, exactly like
     /// the decode path). Correct for every quant format; the per-row submits are

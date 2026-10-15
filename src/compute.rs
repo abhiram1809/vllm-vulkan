@@ -807,6 +807,7 @@ impl ComputeEngine {
             self.device
                 .cmd_copy_buffer(cb, staging.buffer, dst.buffer, &[copy]);
         }
+        self.record_transfer_to_compute_barrier(cb);
         self.end_and_submit(cb)?;
 
         // staging dropped here, freeing the host buffer.
@@ -823,6 +824,7 @@ impl ComputeEngine {
         let staging = self.alloc_staging(size)?;
 
         let cb = self.begin_one_shot()?;
+        self.record_compute_to_transfer_barrier(cb);
         let copy = vk::BufferCopy::default()
             .src_offset(0)
             .dst_offset(0)
@@ -831,6 +833,7 @@ impl ComputeEngine {
             self.device
                 .cmd_copy_buffer(cb, src.buffer, staging.buffer, &[copy]);
         }
+        self.record_transfer_to_host_barrier(cb);
         self.end_and_submit(cb)?;
 
         out.resize(size as usize, 0);
@@ -857,6 +860,7 @@ impl ComputeEngine {
     }
 
     fn end_and_submit(&self, cb: vk::CommandBuffer) -> Result<(), String> {
+        self.record_compute_to_host_barrier(cb);
         unsafe { self.device.end_command_buffer(cb) }
             .map_err(|e| format!("end_command_buffer: {e}"))?;
 
@@ -911,68 +915,14 @@ impl ComputeEngine {
         push_constants: &[u8],
         workgroups: (u32, u32, u32),
     ) -> Result<(), String> {
-        self.assert_owner();
-        let (vk_pipeline, vk_layout) = {
-            let pipeline = self
-                .pipeline_cache
-                .get(shader_name)
-                .ok_or_else(|| format!("Shader '{shader_name}' not found"))?;
-            (pipeline.pipeline, pipeline.layout)
-        };
-
-        let ds = self.next_descriptor_set()?;
-
-        // `buffers.len()` is always <= MAX_BINDINGS (the descriptor set
-        // layout has exactly that many bindings — see pipeline.rs), so
-        // both of these can be fixed-size stack arrays instead of heap-
-        // allocated `Vec`s that this function rebuilt from scratch on
-        // every single dispatch (several hundred times per decode step in
-        // the decode hot path). `buffer_infos` must outlive the
-        // `update_descriptor_sets` call below since each `writes[i]`
-        // stores a raw pointer into it (via `.buffer_info(...)`) — same
-        // requirement the original `Vec`-based version had, just now
-        // satisfied by a stack array that isn't moved instead of a heap
-        // allocation that wasn't either.
-        let n = buffers.len();
-        // A real (not debug-only) check: `debug_assert!` is compiled out in
-        // release builds, which would leave the out-of-bounds
-        // `buffer_infos[i]`/`writes[i]` array writes below as the only
-        // thing standing between an over-large `buffers` slice and a
-        // panic — Rust's array indexing always bounds-checks (so this
-        // could never become silent memory corruption), but it's a worse,
-        // less diagnosable failure mode than returning the `Err` this
-        // function's signature already supports for its other error
-        // paths (e.g. "Shader not found" above).
-        if n > MAX_BINDINGS as usize {
-            return Err(format!(
-                "record_to: {n} buffers exceeds MAX_BINDINGS ({MAX_BINDINGS})"
-            ));
-        }
-
-        let mut buffer_infos = [vk::DescriptorBufferInfo::default(); MAX_BINDINGS as usize];
-        for (i, b) in buffers.iter().enumerate() {
-            buffer_infos[i] = vk::DescriptorBufferInfo::default()
-                .buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE);
-        }
-
-        let mut writes = [vk::WriteDescriptorSet::default(); MAX_BINDINGS as usize];
-        for i in 0..n {
-            writes[i] = vk::WriteDescriptorSet::default()
-                .dst_set(ds).dst_binding(i as u32)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(std::slice::from_ref(&buffer_infos[i]));
-        }
-        unsafe { self.device.update_descriptor_sets(&writes[..n], &[]) };
-
-        unsafe {
-            if !push_constants.is_empty() {
-                self.device.cmd_push_constants(cb, vk_layout, vk::ShaderStageFlags::COMPUTE, 0, push_constants);
-            }
-            self.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, vk_pipeline);
-            self.device.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, vk_layout, 0, &[ds], &[]);
-            self.device.cmd_dispatch(cb, workgroups.0, workgroups.1, workgroups.2);
-        }
-        Ok(())
+        self.record_dispatch_to(
+            cb,
+            shader_name,
+            buffers.iter().map(|&buffer| (buffer, 0)),
+            push_constants,
+            workgroups,
+            "record_to",
+        )
     }
 
     /// Like `record_to`, but each binding carries its own BYTE offset into the
@@ -989,7 +939,35 @@ impl ComputeEngine {
         push_constants: &[u8],
         workgroups: (u32, u32, u32),
     ) -> Result<(), String> {
+        self.record_dispatch_to(
+            cb,
+            shader_name,
+            buffers.iter().copied(),
+            push_constants,
+            workgroups,
+            "record_to_off",
+        )
+    }
+
+    /// Shared recording path. Exact-size iterators let both wrappers provide
+    /// offsets without allocating or copying an intermediate binding list.
+    fn record_dispatch_to<'a>(
+        &mut self,
+        cb: vk::CommandBuffer,
+        shader_name: &str,
+        buffers: impl ExactSizeIterator<Item = (&'a Buffer, u64)>,
+        push_constants: &[u8],
+        workgroups: (u32, u32, u32),
+        caller: &str,
+    ) -> Result<(), String> {
         self.assert_owner();
+        let n = buffers.len();
+        if n > MAX_BINDINGS as usize {
+            return Err(format!(
+                "{caller}: {n} buffers exceeds MAX_BINDINGS ({MAX_BINDINGS})"
+            ));
+        }
+
         let (vk_pipeline, vk_layout) = {
             let pipeline = self
                 .pipeline_cache
@@ -1000,26 +978,47 @@ impl ComputeEngine {
 
         let ds = self.next_descriptor_set()?;
 
-        let buffer_infos: Vec<vk::DescriptorBufferInfo> = buffers
-            .iter()
-            .map(|(b, off)| vk::DescriptorBufferInfo::default()
-                .buffer(b.buffer).offset(*off).range(vk::WHOLE_SIZE))
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = buffer_infos.iter().enumerate()
-            .map(|(i, info)| vk::WriteDescriptorSet::default()
-                .dst_set(ds).dst_binding(i as u32)
+        // Stack storage avoids allocations on both hot paths. Finish the infos
+        // before constructing writes; their pointers stay valid through the update.
+        let mut buffer_infos = [vk::DescriptorBufferInfo::default(); MAX_BINDINGS as usize];
+        for (i, (b, off)) in buffers.enumerate() {
+            buffer_infos[i] = vk::DescriptorBufferInfo::default()
+                .buffer(b.buffer)
+                .offset(off)
+                .range(vk::WHOLE_SIZE);
+        }
+        let mut writes = [vk::WriteDescriptorSet::default(); MAX_BINDINGS as usize];
+        for i in 0..n {
+            writes[i] = vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(i as u32)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(std::slice::from_ref(info)))
-            .collect();
-        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+                .buffer_info(std::slice::from_ref(&buffer_infos[i]));
+        }
+        unsafe { self.device.update_descriptor_sets(&writes[..n], &[]) };
 
         unsafe {
             if !push_constants.is_empty() {
-                self.device.cmd_push_constants(cb, vk_layout, vk::ShaderStageFlags::COMPUTE, 0, push_constants);
+                self.device.cmd_push_constants(
+                    cb,
+                    vk_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    push_constants,
+                );
             }
-            self.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, vk_pipeline);
-            self.device.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, vk_layout, 0, &[ds], &[]);
-            self.device.cmd_dispatch(cb, workgroups.0, workgroups.1, workgroups.2);
+            self.device
+                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, vk_pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                vk_layout,
+                0,
+                &[ds],
+                &[],
+            );
+            self.device
+                .cmd_dispatch(cb, workgroups.0, workgroups.1, workgroups.2);
         }
         Ok(())
     }
@@ -1031,7 +1030,7 @@ impl ComputeEngine {
     pub fn record_barrier_to(&self, cb: vk::CommandBuffer) {
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
         unsafe {
             self.device.cmd_pipeline_barrier(
                 cb,
@@ -1076,7 +1075,7 @@ impl ComputeEngine {
     pub fn record_transfer_to_compute_barrier(&self, cb: vk::CommandBuffer) {
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
         unsafe {
             self.device.cmd_pipeline_barrier(
                 cb,
@@ -1104,6 +1103,43 @@ impl ComputeEngine {
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[barrier], &[], &[],
+            );
+        }
+    }
+
+    /// Make completed buffer copies visible to subsequent mapped host reads.
+    pub fn record_transfer_to_host_barrier(&self, cb: vk::CommandBuffer) {
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
+
+    /// Make shader writes and batch snapshot copies visible to mapped host reads.
+    /// The caller must also wait for the submission's fence before reading.
+    pub fn record_compute_to_host_barrier(&self, cb: vk::CommandBuffer) {
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
             );
         }
     }
@@ -1153,6 +1189,7 @@ impl ComputeEngine {
         // GPU-exec drain (NOT direct-submit-addressable).
         let _t_qs = std::time::Instant::now();
         // End + submit + wait, but DO NOT free the CB (reused next begin_batch).
+        self.record_compute_to_host_barrier(cb);
         unsafe { self.device.end_command_buffer(cb) }
             .map_err(|e| format!("end batch_cb: {e}"))?;
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
@@ -1189,6 +1226,7 @@ impl ComputeEngine {
     pub fn submit_batch_async(&mut self, cb: vk::CommandBuffer) -> Result<(), String> {
         self.assert_owner();
         let _t_qs = std::time::Instant::now();
+        self.record_compute_to_host_barrier(cb);
         unsafe { self.device.end_command_buffer(cb) }
             .map_err(|e| format!("end batch_cb (async): {e}"))?;
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
@@ -1340,6 +1378,7 @@ impl ComputeEngine {
     ) -> Result<(), String> {
         self.assert_owner();
         let slot = self.ring_cur_slot;
+        self.record_compute_to_host_barrier(cb);
         unsafe { self.device.end_command_buffer(cb) }
             .map_err(|e| format!("end ring cb: {e}"))?;
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
