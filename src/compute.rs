@@ -768,6 +768,7 @@ impl ComputeEngine {
         )
     }
 
+    /// Return the device's maximum range for one storage-buffer descriptor.
     #[cfg(feature = "lfm2")]
     pub(crate) fn storage_buffer_limit(&self) -> u64 {
         unsafe { self.instance.get_physical_device_properties(self.physical_device) }

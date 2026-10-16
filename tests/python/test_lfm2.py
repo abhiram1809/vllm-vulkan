@@ -25,6 +25,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def device():
+    """Select a Vulkan test device and bound CPU reference-model parallelism."""
     devices = _rs.enumerate_devices()
     if not devices:
         pytest.skip("no Vulkan device")
@@ -33,6 +34,7 @@ def device():
 
 
 def compare(actual, expected):
+    """Require finite logits, tight relative error and an identical greedy token."""
     actual = np.asarray(actual, dtype=np.float64)
     expected = np.asarray(expected, dtype=np.float64)
     assert np.isfinite(actual).all()
@@ -53,6 +55,7 @@ def compare(actual, expected):
 def test_forward_against_transformers(
     tmp_path, device, length, hidden, heads, kvheads, dtype
 ):
+    """Check token, chunk and reset forwards plus nonmutating request rejection."""
     checkpoint = tiny_checkpoint(
         tmp_path,
         length=length,
@@ -100,6 +103,7 @@ def test_forward_against_transformers(
 
 
 def test_checkpoint_guards(tmp_path, device):
+    """Reject incompatible architecture, capacity, tensor and coefficient inputs."""
     from safetensors.torch import load_file, save_file
 
     checkpoint = tiny_checkpoint(tmp_path)
@@ -162,6 +166,7 @@ NATIVE_FORMATS = [
 
 
 def qualify_short(gpu, ref):
+    """Compare serial and chunked forwards through resets and invalid requests."""
     ids = [1, 9, 37, 63, 127, 4, 19, 41, 33, 57, 2, 17]
     with torch.inference_mode():
         expected = ref(torch.tensor([ids]), use_cache=False).logits[0].numpy()
@@ -180,6 +185,7 @@ def qualify_short(gpu, ref):
 
 @pytest.mark.parametrize("kind,group", NATIVE_FORMATS)
 def test_native_quant_formats(tmp_path, device, kind, group):
+    """Qualify each native weight encoding against independently decoded logits."""
     checkpoint = tiny_checkpoint(
         tmp_path,
         hidden=256,
@@ -202,6 +208,7 @@ def test_native_quant_formats(tmp_path, device, kind, group):
 
 @pytest.mark.parametrize("hf_names", [False, True])
 def test_mixed_sharded_and_chunked(tmp_path, device, hf_names):
+    """Verify mixed codecs, shard indexes, name prefixes and bounded uploads."""
     checkpoint = tiny_checkpoint(
         tmp_path,
         hidden=256,
@@ -228,6 +235,7 @@ def test_mixed_sharded_and_chunked(tmp_path, device, hf_names):
 
 @pytest.mark.parametrize("kind", ["f32", "mlx4", "mlx6", "nvfp4", "q4_k"])
 def test_embedding_and_projection_row_chunks(tmp_path, device, kind):
+    """Exercise matrix row chunks across embedding and projection boundaries."""
     checkpoint = tiny_checkpoint(
         tmp_path, hidden=256, heads=4, kvheads=2, intermediate=512, quant=kind
     )
@@ -243,6 +251,7 @@ def test_embedding_and_projection_row_chunks(tmp_path, device, kind):
     ["f32", "f16", "bf16", "q4_0", "q4_k", "q8_0", "mlx2", "mlx4", "mlx6", "mlx8"],
 )
 def test_explicit_residency_against_exported_bytes(tmp_path, device, target):
+    """Compare runtime transcoding with exported bytes and native checkpoint reloads."""
     source = tiny_checkpoint(
         tmp_path / "source",
         hidden=256,
@@ -264,6 +273,7 @@ def test_explicit_residency_against_exported_bytes(tmp_path, device, target):
 
 
 def test_quantization_and_shard_rejections(tmp_path, device):
+    """Reject invalid residency options, buffer limits and missing indexed shards."""
     checkpoint = tiny_checkpoint(
         tmp_path / "source", hidden=256, intermediate=512, mixed=True, sharded=True
     )
@@ -285,6 +295,7 @@ def test_quantization_and_shard_rejections(tmp_path, device):
 
 
 def test_fp8_auxiliary_shape_guards(tmp_path, device):
+    """Reject unsupported FP8 scale layouts and accept per-output column scales."""
     from safetensors.torch import load_file, save_file
 
     checkpoint = tiny_checkpoint(tmp_path, hidden=256, intermediate=512, quant="fp8")
@@ -392,6 +403,7 @@ def test_mlx_partial_overrides_inherit_global_mode(
 
 
 def test_fp8_global_exporter_metadata_with_dense_embedding(tmp_path, device):
+    """Keep dense embedding exceptions valid beneath global FP8 exporter metadata."""
     from lfm2_formats import MatrixReader
     from safetensors.torch import load_file, save_file
 
@@ -419,6 +431,7 @@ def test_fp8_global_exporter_metadata_with_dense_embedding(tmp_path, device):
 
 @pytest.mark.parametrize("kind", ["mlx4", "fp8", "nvfp4", "f32"])
 def test_per_matrix_format_metadata_must_match_storage(tmp_path, device, kind):
+    """Reject per-matrix metadata that contradicts actual tensor encodings."""
     checkpoint = tiny_checkpoint(tmp_path, hidden=256, intermediate=512, quant=kind)
     path = checkpoint / "config.json"
     config = json.loads(path.read_text())
@@ -457,6 +470,7 @@ def test_failed_conversion_cleans_output_and_can_retry(tmp_path, device, failure
     with pytest.raises(ValueError):
         _rs.Lfm2Model.convert_checkpoint(str(source), str(destination), "q8_0")
     assert not destination.exists()
+    assert list(destination.parent.iterdir()) == []
 
     if failure_point == "matrix":
         weights[key] = removed
@@ -496,10 +510,11 @@ def test_conversion_preserves_existing_destination(tmp_path, kind):
 
 @pytest.mark.parametrize("valid_candidate", [False, True])
 @pytest.mark.parametrize("extension_suffix", importlib.machinery.EXTENSION_SUFFIXES)
+@pytest.mark.parametrize("platform", ["Linux", "Darwin"])
 def test_build_validates_before_replacing_extension(
-    tmp_path, valid_candidate, extension_suffix
+    tmp_path, valid_candidate, extension_suffix, platform
 ):
-    """Load the staged native module and preserve the installed bytes on failure."""
+    """Select the host library and preserve installed bytes when staging fails."""
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     script = scripts / "build_lfm2.sh"
@@ -518,7 +533,10 @@ def test_build_validates_before_replacing_extension(
         path.write_bytes(original)
     release = tmp_path / "target" / "release"
     release.mkdir(parents=True)
-    candidate = release / "lib_rs.so"
+    library_suffix = ".dylib" if platform == "Darwin" else ".so"
+    candidate = release / ("lib_rs" + library_suffix)
+    other_suffix = ".so" if platform == "Darwin" else ".dylib"
+    (release / ("lib_rs" + other_suffix)).write_bytes(b"wrong platform library")
     if valid_candidate:
         shutil.copy2(_rs.__file__, candidate)
     else:
@@ -529,6 +547,9 @@ def test_build_validates_before_replacing_extension(
     cargo = commands / "cargo"
     cargo.write_text("#!/bin/sh\nexit 0\n")
     cargo.chmod(0o755)
+    uname = commands / "uname"
+    uname.write_text(f"#!/bin/sh\nprintf '%s\\n' '{platform}'\n")
+    uname.chmod(0o755)
     env = dict(os.environ, PYO3_PYTHON=sys.executable, PYTHONPATH=str(tmp_path))
     env["PATH"] = str(commands) + os.pathsep + env["PATH"]
     result = subprocess.run(

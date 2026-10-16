@@ -7,6 +7,7 @@ from vllm_vulkan._rs import Lfm2Model
 
 
 def main():
+    """Parse export options and write a new checkpoint with canonical packed weights."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source")
     parser.add_argument("destination", help="new directory; must not exist")

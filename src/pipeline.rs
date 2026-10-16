@@ -1168,6 +1168,7 @@ mod tests {
     use super::{cols_block_size, read_shader_spirv, unsupported_shader_capability};
 
 
+    /// Verify LFM2 kernels remain usable without narrow storage or subgroup features.
     #[cfg(feature = "lfm2")]
     #[test]
     fn shaders_require_no_narrow_or_subgroup_features() {

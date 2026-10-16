@@ -15,16 +15,19 @@ from transformers.models.lfm2.modeling_lfm2 import Lfm2RotaryEmbedding
 
 
 def dequant(reader, key, start, end):
+    """Decode a matrix row range through the validation-only checkpoint reader."""
     return reader.dequant(key, start, end)
 
 
 class QuantLinear(torch.nn.Module):
     def __init__(self, reader, key):
+        """Bind a logical weight matrix without materializing its dense expansion."""
         super().__init__()
         self.reader, self.key = reader, key
         self.rows = reader.get_slice(key + ".weight").get_shape()[0]
 
     def forward(self, x):
+        """Apply linear projections in row chunks to bound CPU reference memory."""
         return torch.cat(
             [
                 torch.nn.functional.linear(
@@ -39,10 +42,12 @@ class QuantLinear(torch.nn.Module):
 
 class QuantEmbedding(torch.nn.Module):
     def __init__(self, reader, key):
+        """Bind a packed embedding table for decoding only requested token rows."""
         super().__init__()
         self.reader, self.key = reader, key
 
     def forward(self, ids):
+        """Decode token embeddings while preserving the input token-array shape."""
         rows = [
             dequant(self.reader, self.key, int(i), int(i) + 1)[0] for i in ids.flatten()
         ]
@@ -50,6 +55,7 @@ class QuantEmbedding(torch.nn.Module):
 
 
 def reference_model(directory):
+    """Build an eager Transformers oracle using independently decoded checkpoint weights."""
     directory = Path(directory)
     cfg = Lfm2Config.from_dict(json.loads((directory / "config.json").read_text()))
     cfg._attn_implementation = "eager"

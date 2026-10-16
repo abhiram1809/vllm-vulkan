@@ -31,6 +31,7 @@ struct Config {
 }
 
 impl Config {
+    /// Validate supported LFM2 dimensions, operators and unscaled RoPE settings.
     fn parse(v: &serde_json::Value) -> Result<Self, String> {
         let number = |name: &str| -> Result<usize, String> {
             v[name]
@@ -180,6 +181,7 @@ pub struct Lfm2Model {
 }
 
 impl Lfm2Model {
+    /// Validate checkpoint residency and allocate one GPU sequence with bounded buffers.
     fn load(
         path: &Path,
         device_idx: usize,
@@ -327,6 +329,7 @@ impl Lfm2Model {
         })
     }
 
+    /// Reject invalid requests before modifying recurrent state or cache positions.
     fn validate(&self, tokens: &[u32], position: usize) -> Result<(), String> {
         if self.poisoned {
             return Err("lfm2: prior GPU failure; recreate the model before reuse".into());
@@ -352,6 +355,7 @@ impl Lfm2Model {
         Ok(())
     }
 
+    /// Execute a validated token chunk and return final logits, poisoning on GPU failure.
     fn run(&mut self, tokens: &[u32], position: usize) -> Result<Vec<f32>, String> {
         self.validate(tokens, position)?;
         // A runtime failure may leave partial recurrent state or a broken fence.
@@ -370,6 +374,7 @@ impl Lfm2Model {
             .collect())
     }
 
+    /// Record and submit one token through convolution, attention and feed-forward layers.
     fn step(&mut self, token: u32, logits: bool) -> Result<(), String> {
         let c = &self.config;
         let s = &self.scratch;
@@ -465,6 +470,7 @@ impl Lfm2Model {
     }
 }
 
+/// Record FP32 RMS normalization and a barrier for subsequent GPU reads.
 fn norm(
     e: &mut ComputeEngine,
     cb: vk::CommandBuffer,
@@ -485,6 +491,7 @@ fn norm(
     e.record_barrier_to(cb);
     Ok(())
 }
+/// Record residual, activation or recurrent-convolution work and its barrier.
 #[allow(clippy::too_many_arguments)]
 fn elementwise(
     e: &mut ComputeEngine,
@@ -511,6 +518,7 @@ fn elementwise(
 
 #[pymethods]
 impl Lfm2Model {
+    /// Create a single-sequence Vulkan engine with explicit device and residency options.
     #[new]
     #[pyo3(signature=(model_path,device_idx=0,max_seq_len=2048,quant="auto",group_size=64,max_buffer_bytes=None))]
     fn new(
@@ -621,13 +629,16 @@ impl Lfm2Model {
         self.position = 0;
         Ok(())
     }
+    /// Return the next token position in the current cached sequence.
     #[getter]
     fn position(&self) -> usize {
         self.position
     }
+    /// Return the number of configured convolution and attention blocks.
     fn num_layers(&self) -> usize {
         self.layers.len()
     }
+    /// Report that this engine executes its forward operations on Vulkan.
     fn has_gpu(&self) -> bool {
         true
     }
@@ -636,12 +647,14 @@ impl Lfm2Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Build a minimal supported configuration for parser regression tests.
     fn config() -> serde_json::Value {
         serde_json::json!({"model_type":"lfm2","hidden_size":64,"intermediate_size":128,"vocab_size":128,
             "num_attention_heads":2,"num_key_value_heads":1,"num_hidden_layers":2,"conv_L_cache":3,
             "layer_types":["conv","full_attention"],"max_position_embeddings":64,"tie_word_embeddings":true,
             "quantization":{"bits":4,"group_size":64,"mode":"affine"}})
     }
+    /// Reject configurations outside the implemented architecture and dimension limits.
     #[test]
     fn config_rejects_unsupported_architecture_and_formats() {
         let v = config();
@@ -663,6 +676,7 @@ mod tests {
             assert!(Config::parse(&bad).is_err(), "{key}");
         }
     }
+    /// Check RoPE defaults, legacy fallback, nested precedence and invalid bases.
     #[test]
     fn rope_theta_defaults_legacy_values_and_nested_precedence() {
         let mut v = config();

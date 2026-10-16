@@ -10,6 +10,7 @@ from vllm_vulkan._rs import Lfm2Model
 
 
 def main():
+    """Tokenize a chat prompt and greedily decode one sequence on the selected GPU."""
     parser = argparse.ArgumentParser()
     parser.add_argument("model", help="local LFM2 safetensors checkpoint directory")
     parser.add_argument("--device", type=int, default=0)

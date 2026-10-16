@@ -40,6 +40,9 @@ standalone, single-sequence Vulkan forward engine. Activations, KV cache and
 convolution state stay on the GPU; FP16 arithmetic and subgroup extensions
 are not required.
 
+The generation script requires `transformers` for `AutoTokenizer`, included
+in the package dependencies.
+
 ```bash
 PYO3_PYTHON=python3 bash scripts/build_lfm2.sh
 PYTHONPATH=. python3 scripts/run_lfm2.py /path/to/checkpoint --device 1

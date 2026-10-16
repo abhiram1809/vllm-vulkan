@@ -19,6 +19,7 @@ from vllm_vulkan import _rs
 
 
 def main():
+    """Compare GPU logits and cache lifecycle against an independent FP32 oracle."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--device", type=int, default=0)
@@ -42,6 +43,7 @@ def main():
     reference_directory = Path(args.reference_model or args.model)
 
     def create_gpu(capacity):
+        """Create an engine with the requested residency and sequence capacity."""
         return Lfm2Model(
             str(directory),
             args.device,
@@ -67,6 +69,7 @@ def main():
     checks = []
 
     def check(label, actual, expected):
+        """Require finite, matching full-vocabulary logits and record error metrics."""
         actual = np.asarray(actual, dtype=np.float64)
         expected = np.asarray(expected, dtype=np.float64)
         relative = float(np.linalg.norm(actual - expected) / np.linalg.norm(expected))
@@ -161,6 +164,7 @@ def main():
         check(f"chat/decode/{i}", actual, expected[len(prompt) + i])
 
     def checkpoint_hashes(path):
+        """Hash checkpoint configuration, index and shards for reproducible reports."""
         names = ["config.json"]
         index = path / "model.safetensors.index.json"
         if index.exists():

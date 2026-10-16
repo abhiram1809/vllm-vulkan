@@ -10,6 +10,7 @@ from safetensors import safe_open
 
 class MatrixReader:
     def __init__(self, directory):
+        """Index checkpoint tensors and defer opening shards until they are needed."""
         self.directory = Path(directory)
         self.config = json.loads((self.directory / "config.json").read_text())
         index = self.directory / "model.safetensors.index.json"
@@ -28,6 +29,7 @@ class MatrixReader:
                     self.locations[key] = file.name
 
     def open(self, name):
+        """Cache a read-only safetensors handle for one checkpoint shard."""
         if name not in self.handles:
             self.handles[name] = safe_open(
                 self.directory / name, framework="pt", device="cpu"
@@ -35,15 +37,19 @@ class MatrixReader:
         return self.handles[name]
 
     def keys(self):
+        """List logical tensor names across every indexed shard."""
         return self.locations.keys()
 
     def get_tensor(self, name):
+        """Read a complete tensor from the shard named by the checkpoint index."""
         return self.open(self.locations[name]).get_tensor(name)
 
     def get_slice(self, name):
+        """Expose lazy tensor slicing without expanding an entire weight matrix."""
         return self.open(self.locations[name]).get_slice(name)
 
     def metadata(self, key):
+        """Resolve per-matrix quantization metadata across supported name prefixes."""
         q = self.config.get("quantization", self.config.get("quantization_config", {}))
         relative = key.removeprefix("language_model.").removeprefix("model.")
         for name in [key, "model." + relative, relative]:
@@ -53,6 +59,7 @@ class MatrixReader:
         return q
 
     def dequant(self, key, start, end):
+        """Decode selected matrix rows to FP32 using independent reference codecs."""
         t = self.get_slice(key + ".weight")[start:end]
         if t.dtype in (torch.float32, torch.float16, torch.bfloat16):
             return t.float()
@@ -133,6 +140,7 @@ class MatrixReader:
 
 
 def decode_ggml(data, kind):
+    """Decode Q4_0, Q4_K or Q8_0 byte blocks into row-major FP32 weights."""
     rows = data.shape[0]
     block_bytes = {"q4_0": 18, "q8_0": 34, "q4_k": 144}[kind]
     blocks = data.reshape(rows, -1, block_bytes)

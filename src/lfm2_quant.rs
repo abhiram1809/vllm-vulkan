@@ -24,6 +24,7 @@ enum Format {
     Nvfp4,
 }
 impl Format {
+    /// Return the canonical checkpoint format identifier.
     fn name(self) -> &'static str {
         match self {
             Self::F32 => "f32",
@@ -46,6 +47,7 @@ pub(super) struct Target {
     group: usize,
 }
 impl Target {
+    /// Resolve native or explicit residency and validate MLX grouping options.
     pub fn parse(name: &str, group: usize) -> Result<Self, String> {
         let (format,bits)=match name {
             "auto"=>(None,0), "f32"=>(Some(Format::F32),0), "f16"=>(Some(Format::F16),0),
@@ -74,6 +76,7 @@ pub(super) struct Checkpoint {
     pub directory: PathBuf,
 }
 impl Checkpoint {
+    /// Map checkpoint shards and validate unique tensor names against the shard index.
     pub fn open(path: &Path) -> Result<Self, String> {
         let dir = if path.is_dir() {
             path
@@ -166,6 +169,7 @@ impl Checkpoint {
             directory: dir.to_path_buf(),
         })
     }
+    /// Borrow an indexed tensor by its complete checkpoint name.
     fn raw(&self, name: &str) -> Result<TensorView<'_>, String> {
         let i = *self
             .names
@@ -176,12 +180,15 @@ impl Checkpoint {
             .tensor(name)
             .map_err(|e| e.to_string())
     }
+    /// Resolve a logical tensor name beneath the detected model prefix.
     fn get(&self, name: &str) -> Result<TensorView<'_>, String> {
         self.raw(&format!("{}{name}", self.prefix))
     }
+    /// Test whether a prefixed logical tensor is present in the checkpoint.
     fn has(&self, name: &str) -> bool {
         self.names.contains_key(&format!("{}{name}", self.prefix))
     }
+    /// Decode finite floating coefficients after checking the expected tensor shape.
     pub fn floats(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
         let t = self.get(name)?;
         if t.shape() != shape {
@@ -193,6 +200,7 @@ impl Checkpoint {
         }
         float_values(&t, name)
     }
+    /// Validate floating coefficients and upload their FP32 representation.
     pub fn upload_floats(
         &self,
         e: &mut ComputeEngine,
@@ -201,12 +209,14 @@ impl Checkpoint {
     ) -> Result<Buffer, String> {
         upload(e, bytemuck::cast_slice(&self.floats(name, shape)?))
     }
+    /// Read global quantization settings using the supported exporter keys.
     fn quantization(&self) -> &Value {
         self.config
             .get("quantization")
             .or_else(|| self.config.get("quantization_config"))
             .unwrap_or(&Value::Null)
     }
+    /// Resolve matrix-specific metadata and indicate whether it overrides global settings.
     fn metadata(&self, name: &str) -> (&Value, bool) {
         let q = self.quantization();
         for key in [
@@ -224,6 +234,7 @@ impl Checkpoint {
         }
         (q, false)
     }
+    /// Validate one matrix encoding and coefficients before GPU upload or conversion.
     fn cpu_matrix(&self, name: &str, n: usize, k: usize) -> Result<CpuMatrix, String> {
         let t = self.get(&format!("{name}.weight"))?;
         let (q, per_matrix_metadata) = self.metadata(name);
@@ -426,6 +437,7 @@ impl Checkpoint {
         }
         Ok(c)
     }
+    /// Load, optionally transcode and upload a matrix within the device buffer limit.
     pub fn matrix(
         &self,
         e: &mut ComputeEngine,
@@ -440,6 +452,7 @@ impl Checkpoint {
     }
 }
 
+/// Decode finite F32, F16 or BF16 tensor values into FP32 coefficients.
 fn float_values(t: &TensorView<'_>, name: &str) -> Result<Vec<f32>, String> {
     let v: Vec<f32> = match t.dtype() {
         Dtype::F32 => t
@@ -477,6 +490,7 @@ struct CpuMatrix {
     biases: Vec<f32>,
 }
 impl CpuMatrix {
+    /// Return the column alignment required by the packed GGML codec.
     fn block_size(&self) -> usize {
         if self.format == Format::Q4K {
             256
@@ -484,6 +498,7 @@ impl CpuMatrix {
             32
         }
     }
+    /// Calculate one packed matrix row without expanding its coefficients.
     fn row_bytes(&self) -> usize {
         match self.format {
             Format::F32 => self.k * 4,
@@ -496,6 +511,7 @@ impl CpuMatrix {
             Format::Nvfp4 => self.k / 2,
         }
     }
+    /// Expand a bounded row range with the codec matching the stored format.
     fn decode_rows(&self, start: usize, rows: usize) -> Vec<f32> {
         let bytes = &self.data[start * self.row_bytes()..(start + rows) * self.row_bytes()];
         match self.format {
@@ -549,6 +565,7 @@ impl CpuMatrix {
                 .collect(),
         }
     }
+    /// Convert residency in bounded chunks and reject encoded or decoded overflow.
     fn transcode(self, target: Target) -> Result<Self, String> {
         let Some(format) = target.format else {
             return Ok(self);
@@ -670,6 +687,7 @@ impl CpuMatrix {
         }
         Ok(out)
     }
+    /// Report the resident format, including MLX bit width and group size.
     fn label(&self) -> String {
         if self.format == Format::Mlx {
             format!("mlx{}_g{}", self.bits, self.group)
@@ -679,6 +697,7 @@ impl CpuMatrix {
     }
 }
 
+/// Reject empty or oversized requests before allocating a GPU storage buffer.
 pub(super) fn allocate(e: &ComputeEngine, size: usize) -> Result<Buffer, String> {
     let limit = e.storage_buffer_limit() as usize;
     if size == 0 || size > limit {
@@ -688,6 +707,7 @@ pub(super) fn allocate(e: &ComputeEngine, size: usize) -> Result<Buffer, String>
     }
     e.alloc_device(size as u64)
 }
+/// Upload packed data while respecting alignment and storage-buffer limits.
 pub(super) fn upload(e: &mut ComputeEngine, bytes: &[u8]) -> Result<Buffer, String> {
     let mut padded = Vec::new();
     let data = if bytes.len() % 4 == 0 {
@@ -718,6 +738,7 @@ pub(super) struct Matrix {
     label: String,
 }
 impl Matrix {
+    /// Upload packed data while respecting alignment and storage-buffer limits.
     fn upload(e: &mut ComputeEngine, cpu: CpuMatrix, limit: usize) -> Result<Self, String> {
         // Raw byte buffers are padded to uint32 storage. Round the budget down
         // before choosing rows, so padding never exceeds the requested limit.
@@ -777,6 +798,7 @@ impl Matrix {
             label: cpu.label(),
         })
     }
+    /// Build the shader push constants for one matrix part and embedding token.
     fn pc(&self, part: &Part, token: usize) -> [u32; 8] {
         [
             self.k as u32,
@@ -789,9 +811,11 @@ impl Matrix {
             token as u32,
         ]
     }
+    /// Report the resident format, including MLX bit width and group size.
     pub fn label(&self) -> &str {
         &self.label
     }
+    /// Record packed matrix-vector projection dispatches and the resulting barrier.
     pub fn record(
         &self,
         e: &mut ComputeEngine,
@@ -828,6 +852,7 @@ impl Matrix {
         e.record_barrier_to(cb);
         Ok(())
     }
+    /// Record the selected packed embedding row and synchronize subsequent reads.
     pub fn embed(
         &self,
         e: &mut ComputeEngine,
@@ -852,37 +877,61 @@ impl Matrix {
     }
 }
 
-/// Remove incomplete output on error, owning only a newly created directory.
-struct ConversionOutput<'a> {
-    path: &'a Path,
+/// Stage a conversion in an exclusive sibling directory until atomic publication.
+struct ConversionOutput {
+    path: PathBuf,
     complete: bool,
 }
 
-impl<'a> ConversionOutput<'a> {
-    fn create(path: &'a Path) -> Result<Self, String> {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+impl ConversionOutput {
+    /// Reserve a unique sibling staging directory without claiming the destination.
+    fn create(destination: &Path) -> Result<Self, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) => return Err("lfm2: conversion destination must not exist".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
         }
-        // An exclusive leaf creation prevents cleanup from owning an existing
-        // directory, file or symlink, even if another conversion races us.
-        std::fs::create_dir(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                "lfm2: conversion destination must not exist".into()
-            } else {
-                e.to_string()
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        for _ in 0..1024 {
+            let path = parent.join(format!(
+                ".lfm2-conversion-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        complete: false,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.to_string()),
             }
-        })?;
-        Ok(Self {
-            path,
-            complete: false,
-        })
+        }
+        Err("lfm2: cannot create a unique conversion staging directory".into())
+    }
+
+    /// Publish all shards together, preserving even an empty concurrent destination.
+    fn publish(mut self, destination: &Path) -> Result<(), String> {
+        publish_conversion(&self.path, destination)?;
+        self.complete = true;
+        Ok(())
     }
 }
 
-impl Drop for ConversionOutput<'_> {
+impl Drop for ConversionOutput {
+    /// Remove unpublished staging data while leaving the requested destination untouched.
     fn drop(&mut self) {
         if !self.complete {
-            if let Err(error) = std::fs::remove_dir_all(self.path) {
+            if let Err(error) = std::fs::remove_dir_all(&self.path) {
                 log::warn!(
                     "lfm2: cannot remove incomplete conversion {}: {error}",
                     self.path.display()
@@ -890,6 +939,47 @@ impl Drop for ConversionOutput<'_> {
             }
         }
     }
+}
+
+/// Rename without replacement; a check followed by plain rename has a race.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_conversion(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    let destination =
+        CString::new(destination.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    // SAFETY: Both C strings remain valid and NUL-terminated for the syscall.
+    // Exclusive rename publishes atomically and cannot replace another writer.
+    let result = unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        }
+        #[cfg(target_os = "macos")]
+        {
+            libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL)
+        }
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "lfm2: cannot publish converted checkpoint: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+/// Reject export on platforms lacking an implemented exclusive rename.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn publish_conversion(_source: &Path, _destination: &Path) -> Result<(), String> {
+    Err("lfm2: atomic checkpoint export requires Linux or macOS".into())
 }
 
 /// Export one logical matrix per safetensors shard. The same canonical CPU
@@ -904,7 +994,8 @@ pub(super) fn convert_checkpoint(
 ) -> Result<(), String> {
     let ck = Checkpoint::open(source)?;
     let target = Target::parse(quant, group_size)?;
-    let mut output = ConversionOutput::create(destination)?;
+    let output = ConversionOutput::create(destination)?;
+    let staging = &output.path;
     let mut weight_map = HashMap::new();
     let mut metadata = serde_json::Map::new();
     for (i, (name, n, k)) in specs.iter().enumerate() {
@@ -966,7 +1057,7 @@ pub(super) fn convert_checkpoint(
         };
         metadata.insert(root, info);
         let file = format!("model-{i:05}.safetensors");
-        write_tensors(&destination.join(&file), &tensors)?;
+        write_tensors(&staging.join(&file), &tensors)?;
         for name in tensors.keys() {
             weight_map.insert(name.clone(), file.clone());
         }
@@ -989,7 +1080,7 @@ pub(super) fn convert_checkpoint(
     }
     if !small.is_empty() {
         let file = "model-small.safetensors";
-        write_tensors(&destination.join(file), &small)?;
+        write_tensors(&staging.join(file), &small)?;
         for name in small.keys() {
             weight_map.insert(name.clone(), file.to_string());
         }
@@ -1002,12 +1093,12 @@ pub(super) fn convert_checkpoint(
     config["quantization_config"] =
         serde_json::json!({"quant_method":"vllm_vulkan","tensor_formats":metadata});
     std::fs::write(
-        destination.join("config.json"),
+        staging.join("config.json"),
         serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     std::fs::write(
-        destination.join("model.safetensors.index.json"),
+        staging.join("model.safetensors.index.json"),
         serde_json::to_vec_pretty(&serde_json::json!({"weight_map":weight_map}))
             .map_err(|e| e.to_string())?,
     )
@@ -1021,13 +1112,13 @@ pub(super) fn convert_checkpoint(
     ] {
         let path = ck.directory.join(name);
         if path.exists() {
-            std::fs::copy(path, destination.join(name)).map_err(|e| e.to_string())?;
+            std::fs::copy(path, staging.join(name)).map_err(|e| e.to_string())?;
         }
     }
-    output.complete = true;
-    Ok(())
+    output.publish(destination)
 }
 
+/// Serialize validated tensor views into a single safetensors shard.
 fn write_tensors(
     path: &Path,
     tensors: &HashMap<String, (Dtype, Vec<usize>, Vec<u8>)>,
@@ -1045,6 +1136,114 @@ fn write_tensors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Create a private RAII workspace for conversion-publication regression tests.
+    fn conversion_workspace() -> ConversionOutput {
+        let destination = std::env::temp_dir().join(format!(
+            "lfm2-output-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        ConversionOutput::create(&destination).unwrap()
+    }
+
+    /// Keep another writer's destination intact when an incomplete conversion drops.
+    #[test]
+    fn failed_conversion_cleanup_preserves_replaced_destination() {
+        let root = conversion_workspace();
+        let destination = root.path.join("converted");
+        let output = ConversionOutput::create(&destination).unwrap();
+        // Model an external writer replacing the destination before failure.
+        if destination.exists() {
+            std::fs::remove_dir_all(&destination).unwrap();
+        }
+        std::fs::create_dir(&destination).unwrap();
+        let sentinel = destination.join("keep.txt");
+        std::fs::write(&sentinel, b"other writer").unwrap();
+        drop(output);
+        let preserved = std::fs::read(&sentinel);
+        assert_eq!(preserved.unwrap(), b"other writer");
+    }
+
+    /// Expose all staged output files together only after successful publication.
+    #[test]
+    fn conversion_is_visible_only_after_complete_publication() {
+        let root = conversion_workspace();
+        let destination = root.path.join("converted");
+        let output = ConversionOutput::create(&destination).unwrap();
+        let staging = output.path.clone();
+        std::fs::write(staging.join("shard"), b"weights").unwrap();
+        std::fs::write(staging.join("config.json"), b"{}").unwrap();
+        assert!(!destination.exists());
+        output.publish(&destination).unwrap();
+        assert!(!staging.exists());
+        assert_eq!(
+            std::fs::read(destination.join("shard")).unwrap(),
+            b"weights"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("config.json")).unwrap(),
+            b"{}"
+        );
+    }
+
+    /// Reject publication over concurrent directories, files and dangling symlinks.
+    #[cfg(unix)]
+    #[test]
+    fn conversion_publication_preserves_concurrent_destinations() {
+        let root = conversion_workspace();
+        for kind in ["empty_directory", "directory", "file", "symlink"] {
+            let destination = root.path.join(kind);
+            let output = ConversionOutput::create(&destination).unwrap();
+            let staging = output.path.clone();
+            std::fs::write(staging.join("shard"), b"our weights").unwrap();
+            match kind {
+                "empty_directory" => std::fs::create_dir(&destination).unwrap(),
+                "directory" => {
+                    std::fs::create_dir(&destination).unwrap();
+                    std::fs::write(destination.join("keep"), b"other writer").unwrap();
+                }
+                "file" => std::fs::write(&destination, b"other writer").unwrap(),
+                _ => std::os::unix::fs::symlink("missing-target", &destination).unwrap(),
+            }
+            assert!(output.publish(&destination).is_err(), "{kind}");
+            assert!(!staging.exists(), "{kind}: staging was not cleaned");
+            match kind {
+                "empty_directory" => {
+                    assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+                }
+                "directory" => assert_eq!(
+                    std::fs::read(destination.join("keep")).unwrap(),
+                    b"other writer"
+                ),
+                "file" => assert_eq!(std::fs::read(&destination).unwrap(), b"other writer"),
+                _ => assert_eq!(
+                    std::fs::read_link(&destination).unwrap(),
+                    Path::new("missing-target")
+                ),
+            }
+        }
+    }
+
+    /// Allow one staged conversion to publish while preserving it from a second writer.
+    #[test]
+    fn concurrent_conversions_have_one_publication_winner() {
+        let root = conversion_workspace();
+        let destination = root.path.join("converted");
+        let first = ConversionOutput::create(&destination).unwrap();
+        let second = ConversionOutput::create(&destination).unwrap();
+        assert_ne!(first.path, second.path);
+        std::fs::write(first.path.join("shard"), b"first").unwrap();
+        std::fs::write(second.path.join("shard"), b"second").unwrap();
+        first.publish(&destination).unwrap();
+        let staging = second.path.clone();
+        assert!(second.publish(&destination).is_err());
+        assert!(!staging.exists());
+        assert_eq!(std::fs::read(destination.join("shard")).unwrap(), b"first");
+    }
+    /// Validate residency names and reject incompatible packed column alignments.
     #[test]
     fn residency_is_explicit_and_alignment_checked() {
         for name in [
@@ -1073,6 +1272,7 @@ mod tests {
             .unwrap()
             .contains("alignment"));
     }
+    /// Check finite codec round trips including cross-word MLX packed values.
     #[test]
     fn mlx_cross_word_conversion_and_block_codecs_are_finite() {
         let values: Vec<f32> = (0..1024)
@@ -1104,6 +1304,7 @@ mod tests {
             assert!(error < 30., "{name}: {error}");
         }
     }
+    /// Reject conversions whose encoded scales overflow despite finite input weights.
     #[test]
     fn encoded_scale_overflow_is_rejected() {
         for name in ["f16", "bf16", "q4_0", "q4_k", "q8_0", "mlx2"] {
