@@ -831,6 +831,46 @@ impl Matrix {
     }
 }
 
+/// Remove incomplete output on error, owning only a newly created directory.
+struct ConversionOutput<'a> {
+    path: &'a Path,
+    complete: bool,
+}
+
+impl<'a> ConversionOutput<'a> {
+    fn create(path: &'a Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        // An exclusive leaf creation prevents cleanup from owning an existing
+        // directory, file or symlink, even if another conversion races us.
+        std::fs::create_dir(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                "lfm2: conversion destination must not exist".into()
+            } else {
+                e.to_string()
+            }
+        })?;
+        Ok(Self {
+            path,
+            complete: false,
+        })
+    }
+}
+
+impl Drop for ConversionOutput<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            if let Err(error) = std::fs::remove_dir_all(self.path) {
+                log::warn!(
+                    "lfm2: cannot remove incomplete conversion {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
 /// Export one logical matrix per safetensors shard. The same canonical CPU
 /// encoders used for residency conversion produce inspectable packed bytes;
 /// the independent oracle decodes those bytes without calling this module.
@@ -843,10 +883,7 @@ pub(super) fn convert_checkpoint(
 ) -> Result<(), String> {
     let ck = Checkpoint::open(source)?;
     let target = Target::parse(quant, group_size)?;
-    if destination.exists() {
-        return Err("lfm2: conversion destination must not exist".into());
-    }
-    std::fs::create_dir_all(destination).map_err(|e| e.to_string())?;
+    let mut output = ConversionOutput::create(destination)?;
     let mut weight_map = HashMap::new();
     let mut metadata = serde_json::Map::new();
     for (i, (name, n, k)) in specs.iter().enumerate() {
@@ -966,6 +1003,7 @@ pub(super) fn convert_checkpoint(
             std::fs::copy(path, destination.join(name)).map_err(|e| e.to_string())?;
         }
     }
+    output.complete = true;
     Ok(())
 }
 

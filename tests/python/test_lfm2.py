@@ -2,6 +2,8 @@
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -344,3 +346,99 @@ def test_per_matrix_format_metadata_must_match_storage(tmp_path, device, kind):
     path.write_text(json.dumps(config))
     with pytest.raises(ValueError, match="format metadata"):
         _rs.Lfm2Model(str(checkpoint), device, 20)
+
+
+@pytest.mark.parametrize("failure_point", ["matrix", "tokenizer"])
+def test_failed_conversion_cleans_output_and_can_retry(tmp_path, device, failure_point):
+    """Errors after shard writes must leave the same destination available for retry."""
+    from safetensors.torch import load_file, save_file
+
+    source = tiny_checkpoint(tmp_path / "source")
+    destination = tmp_path / "nested" / "converted"
+    weights_file = source / "model.safetensors"
+    if failure_point == "matrix":
+        weights = {key: value.clone() for key, value in load_file(weights_file).items()}
+        key = "language_model.model.layers.0.feed_forward.w1.weight"
+        removed = weights.pop(key)
+        save_file(weights, weights_file)
+    else:
+        (source / "tokenizer.json").mkdir()
+
+    with pytest.raises(ValueError):
+        _rs.Lfm2Model.convert_checkpoint(str(source), str(destination), "q8_0")
+    assert not destination.exists()
+
+    if failure_point == "matrix":
+        weights[key] = removed
+        save_file(weights, weights_file)
+    else:
+        (source / "tokenizer.json").rmdir()
+    _rs.Lfm2Model.convert_checkpoint(str(source), str(destination), "q8_0")
+    gpu = _rs.Lfm2Model(str(destination), device, 20)
+    qualify_short(gpu, reference_model(destination))
+
+
+@pytest.mark.parametrize("kind", ["directory", "file", "dangling_symlink"])
+def test_conversion_preserves_existing_destination(tmp_path, kind):
+    """Rejected output paths must remain intact, including dangling symlinks."""
+    source = tiny_checkpoint(tmp_path / "source")
+    destination = tmp_path / "existing"
+    if kind == "directory":
+        destination.mkdir()
+        sentinel = destination / "keep.txt"
+        sentinel.write_bytes(b"existing output")
+    elif kind == "file":
+        sentinel = destination
+        sentinel.write_bytes(b"existing output")
+    else:
+        destination.symlink_to("missing-target", target_is_directory=True)
+
+    with pytest.raises(ValueError):
+        _rs.Lfm2Model.convert_checkpoint(str(source), str(destination), "q8_0")
+    if kind == "dangling_symlink":
+        assert destination.is_symlink()
+        assert destination.readlink() == Path("missing-target")
+    else:
+        assert sentinel.read_bytes() == b"existing output"
+        if kind == "directory":
+            assert list(destination.iterdir()) == [sentinel]
+
+
+@pytest.mark.parametrize("valid_candidate", [False, True])
+def test_build_validates_before_replacing_extension(tmp_path, valid_candidate):
+    """Load the staged native module and preserve the installed bytes on failure."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    script = scripts / "build_lfm2.sh"
+    shutil.copy2(Path(__file__).resolve().parents[2] / "scripts/build_lfm2.sh", script)
+    package = tmp_path / "vllm_vulkan"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    installed = package / "_rs.so"
+    original = b"previous working extension"
+    installed.write_bytes(original)
+    release = tmp_path / "target" / "release"
+    release.mkdir(parents=True)
+    candidate = release / "lib_rs.so"
+    if valid_candidate:
+        shutil.copy2(_rs.__file__, candidate)
+    else:
+        candidate.write_bytes(b"invalid extension")
+
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    cargo = commands / "cargo"
+    cargo.write_text("#!/bin/sh\nexit 0\n")
+    cargo.chmod(0o755)
+    env = dict(os.environ, PYO3_PYTHON=sys.executable, PYTHONPATH=str(tmp_path))
+    env["PATH"] = str(commands) + os.pathsep + env["PATH"]
+    result = subprocess.run(
+        ["bash", str(script)], env=env, capture_output=True, text=True
+    )
+    if valid_candidate:
+        assert result.returncode == 0, result.stderr
+        assert installed.read_bytes() == candidate.read_bytes()
+    else:
+        assert result.returncode != 0
+        assert installed.read_bytes() == original
+    assert list(package.glob("_rs.so.*")) == []
