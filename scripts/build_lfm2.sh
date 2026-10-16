@@ -3,7 +3,17 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 export PYO3_PYTHON="${PYO3_PYTHON:-python3}"
 cargo build --release --no-default-features --features multiple-pymethods,lfm2,pyo3/extension-module
-staged_extension=$(mktemp vllm_vulkan/_rs.so.XXXXXX)
+installed_extension=$("$PYO3_PYTHON" - <<'PY'
+from importlib.machinery import EXTENSION_SUFFIXES, ExtensionFileLoader, FileFinder
+from pathlib import Path
+
+directory = Path("vllm_vulkan").resolve()
+finder = FileFinder(str(directory), (ExtensionFileLoader, EXTENSION_SUFFIXES))
+spec = finder.find_spec("_rs")
+print(spec.origin if spec else directory / "_rs.so")
+PY
+)
+staged_extension=$(mktemp "${installed_extension}.XXXXXX")
 trap 'rm -f -- "$staged_extension"' EXIT
 cp -p target/release/lib_rs.so "$staged_extension"
 "$PYO3_PYTHON" - "$staged_extension" <<'PY'
@@ -22,6 +32,7 @@ sys.modules[loader.name] = module
 loader.exec_module(module)
 from vllm_vulkan import _rs
 
+assert hasattr(_rs, "Lfm2Model"), "staged extension is missing Lfm2Model"
 print(_rs.enumerate_devices())
 PY
-mv "$staged_extension" vllm_vulkan/_rs.so
+mv -- "$staged_extension" "$installed_extension"

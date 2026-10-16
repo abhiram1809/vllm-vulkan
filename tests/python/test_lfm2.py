@@ -1,5 +1,6 @@
 """Full-logit tests against HF Transformers, including recurrent/KV lifecycle."""
 
+import importlib.machinery
 import json
 import os
 import shutil
@@ -301,6 +302,95 @@ def test_fp8_auxiliary_shape_guards(tmp_path, device):
     qualify_short(gpu, reference_model(checkpoint))
 
 
+@pytest.mark.parametrize("kind", ["fp8", "fp8_tensor", "nvfp4"])
+def test_native_float_quant_decoded_overflow_is_rejected(tmp_path, device, kind):
+    """Finite coefficients must not allow an overflowing weight past auto loading."""
+    from safetensors.torch import load_file, save_file
+
+    checkpoint = tiny_checkpoint(tmp_path, hidden=256, intermediate=512, quant=kind)
+    file = checkpoint / "model.safetensors"
+    weights = {key: value.clone() for key, value in load_file(file).items()}
+    root = "language_model.model.embed_tokens"
+    # Put the bad value in the last row so validation must scan beyond one chunk.
+    weights[root + ".weight"].view(torch.uint8).zero_()
+    if kind == "nvfp4":
+        weights[root + ".weight_scale"] = torch.ones_like(
+            weights[root + ".weight_scale"], dtype=torch.float32
+        )
+        weights[root + ".weight_scale_2"] = torch.tensor([1e38])
+        weights[root + ".weight"][-1, -1] = 0x77  # two E2M1 values of 6
+    else:
+        weights[root + ".weight_scale"] = torch.full_like(
+            weights[root + ".weight_scale"], 1e38, dtype=torch.float32
+        )
+        weights[root + ".weight"].view(torch.uint8)[-1, -1] = 0x7E  # E4M3 448
+    save_file(weights, file)
+    with pytest.raises(ValueError, match="non-finite decoded"):
+        _rs.Lfm2Model(str(checkpoint), device, 20, quant="auto")
+    destination = tmp_path / "converted"
+    with pytest.raises(ValueError, match="non-finite decoded"):
+        _rs.Lfm2Model.convert_checkpoint(str(checkpoint), str(destination), "f32")
+    assert not destination.exists()
+
+    # Large finite scales with zero codes are valid; validate actual decoded values.
+    weights[root + ".weight"].view(torch.uint8).zero_()
+    save_file(weights, file)
+    gpu = _rs.Lfm2Model(str(checkpoint), device, 20)
+    assert np.isfinite(gpu.forward_prefill([1, 9, 37])).all()
+
+
+@pytest.mark.parametrize("layout", ["legacy", "null_parameters", "nested"])
+def test_rope_theta_configuration_against_transformers(tmp_path, device, layout):
+    """Honor legacy theta while retaining nested-parameter precedence."""
+    checkpoint = tiny_checkpoint(tmp_path)
+    file = checkpoint / "config.json"
+    config = json.loads(file.read_text())
+    config["rope_theta"] = 7.0
+    if layout == "nested":
+        config["rope_parameters"]["rope_theta"] = 37.0
+        expected_theta = 37.0
+    else:
+        config.pop("rope_parameters")
+        if layout == "null_parameters":
+            config["rope_parameters"] = None
+        expected_theta = 7.0
+    file.write_text(json.dumps(config))
+    ref = reference_model(checkpoint)
+    assert ref.config.rope_parameters["rope_theta"] == expected_theta
+    gpu = _rs.Lfm2Model(str(checkpoint), device, 20)
+    qualify_short(gpu, ref)
+
+
+@pytest.mark.parametrize("config_key", ["quantization", "quantization_config"])
+@pytest.mark.parametrize("container", ["tensor_formats", "direct"])
+def test_mlx_partial_overrides_inherit_global_mode(
+    tmp_path, device, config_key, container
+):
+    """Mixed MLX bit widths inherit affine mode but may explicitly override it."""
+    checkpoint = tiny_checkpoint(tmp_path, hidden=256, intermediate=512, mixed=True)
+    file = checkpoint / "config.json"
+    config = json.loads(file.read_text())
+    formats = config.pop("quantization_config")["tensor_formats"]
+    for entry in formats.values():
+        if entry.get("format") == "mlx":
+            del entry["format"]
+            del entry["mode"]
+    config[config_key] = {"mode": "affine"}
+    if container == "tensor_formats":
+        config[config_key][container] = formats
+    else:
+        config[config_key].update(formats)
+    root = "language_model.model.embed_tokens"
+    formats[root]["mode"] = "symmetric"
+    file.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="affine metadata"):
+        _rs.Lfm2Model(str(checkpoint), device, 20)
+    del formats[root]["mode"]
+    file.write_text(json.dumps(config))
+    gpu = _rs.Lfm2Model(str(checkpoint), device, 20)
+    qualify_short(gpu, reference_model(checkpoint))
+
+
 def test_fp8_global_exporter_metadata_with_dense_embedding(tmp_path, device):
     from lfm2_formats import MatrixReader
     from safetensors.torch import load_file, save_file
@@ -405,7 +495,10 @@ def test_conversion_preserves_existing_destination(tmp_path, kind):
 
 
 @pytest.mark.parametrize("valid_candidate", [False, True])
-def test_build_validates_before_replacing_extension(tmp_path, valid_candidate):
+@pytest.mark.parametrize("extension_suffix", importlib.machinery.EXTENSION_SUFFIXES)
+def test_build_validates_before_replacing_extension(
+    tmp_path, valid_candidate, extension_suffix
+):
     """Load the staged native module and preserve the installed bytes on failure."""
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -414,9 +507,15 @@ def test_build_validates_before_replacing_extension(tmp_path, valid_candidate):
     package = tmp_path / "vllm_vulkan"
     package.mkdir()
     (package / "__init__.py").write_text("")
-    installed = package / "_rs.so"
+    installed = package / ("_rs" + extension_suffix)
     original = b"previous working extension"
-    installed.write_bytes(original)
+    suffixes = importlib.machinery.EXTENSION_SUFFIXES
+    # Lower-priority copies must neither shadow the replacement nor be overwritten.
+    existing = [
+        package / ("_rs" + s) for s in suffixes[suffixes.index(extension_suffix) :]
+    ]
+    for path in existing:
+        path.write_bytes(original)
     release = tmp_path / "target" / "release"
     release.mkdir(parents=True)
     candidate = release / "lib_rs.so"
@@ -438,7 +537,24 @@ def test_build_validates_before_replacing_extension(tmp_path, valid_candidate):
     if valid_candidate:
         assert result.returncode == 0, result.stderr
         assert installed.read_bytes() == candidate.read_bytes()
+        imported = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from vllm_vulkan import _rs; "
+                "assert hasattr(_rs, 'Lfm2Model'); print(_rs.__file__)",
+            ],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert Path(imported.stdout.strip()) == installed
     else:
         assert result.returncode != 0
         assert installed.read_bytes() == original
-    assert list(package.glob("_rs.so.*")) == []
+    for path in existing:
+        if path != installed:
+            assert path.read_bytes() == original
+    assert sorted(package.glob("_rs*")) == sorted(existing)

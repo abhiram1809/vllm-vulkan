@@ -201,12 +201,14 @@ impl Checkpoint {
     ) -> Result<Buffer, String> {
         upload(e, bytemuck::cast_slice(&self.floats(name, shape)?))
     }
-    fn metadata(&self, name: &str) -> (&Value, bool) {
-        let q = self
-            .config
+    fn quantization(&self) -> &Value {
+        self.config
             .get("quantization")
             .or_else(|| self.config.get("quantization_config"))
-            .unwrap_or(&Value::Null);
+            .unwrap_or(&Value::Null)
+    }
+    fn metadata(&self, name: &str) -> (&Value, bool) {
+        let q = self.quantization();
         for key in [
             format!("{}{name}", self.prefix),
             format!("model.{name}"),
@@ -275,7 +277,11 @@ impl Checkpoint {
                         "{name}: packed MLX dtype disagrees with format metadata"
                     ));
                 }
-                if t.shape().len() != 2 || t.shape()[0] != n || q["mode"] != "affine" {
+                let mode = q.get("mode").or_else(|| self.quantization().get("mode"));
+                if t.shape().len() != 2
+                    || t.shape()[0] != n
+                    || mode.and_then(Value::as_str) != Some("affine")
+                {
                     return Err(format!(
                         "{}; packed MLX requires affine metadata",
                         shape_error()
@@ -402,6 +408,21 @@ impl Checkpoint {
         }
         if c.scales.iter().any(|v| !v.is_finite()) {
             return Err(format!("{name}: non-finite folded scale"));
+        }
+        // Finite folded coefficients can still overflow when multiplied by codes.
+        // Check bounded chunks even when auto residency bypasses transcoding.
+        if matches!(c.format, Format::Fp8 | Format::Nvfp4) {
+            for start in (0..n).step_by(64) {
+                if c.decode_rows(start, (n - start).min(64))
+                    .iter()
+                    .any(|v| !v.is_finite())
+                {
+                    return Err(format!(
+                        "{name}: non-finite decoded {} weight",
+                        c.format.name()
+                    ));
+                }
+            }
         }
         Ok(c)
     }

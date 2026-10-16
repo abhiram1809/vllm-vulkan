@@ -95,7 +95,10 @@ impl Config {
         {
             return Err("lfm2: only default unscaled RoPE is supported".into());
         }
-        let theta = rope["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
+        let theta = rope["rope_theta"]
+            .as_f64()
+            .or_else(|| v["rope_theta"].as_f64())
+            .unwrap_or(10000.0) as f32;
         let eps = v["norm_eps"].as_f64().unwrap_or(1e-5) as f32;
         if !theta.is_finite() || theta <= 0.0 || !eps.is_finite() || eps <= 0.0 {
             return Err("lfm2: invalid RoPE theta or norm epsilon".into());
@@ -658,6 +661,22 @@ mod tests {
             let mut bad = v.clone();
             bad[key] = value;
             assert!(Config::parse(&bad).is_err(), "{key}");
+        }
+    }
+    #[test]
+    fn rope_theta_defaults_legacy_values_and_nested_precedence() {
+        let mut v = config();
+        assert_eq!(Config::parse(&v).unwrap().theta, 10000.0);
+        v["rope_theta"] = serde_json::json!(7.0);
+        assert_eq!(Config::parse(&v).unwrap().theta, 7.0);
+        v["rope_parameters"] = serde_json::Value::Null;
+        assert_eq!(Config::parse(&v).unwrap().theta, 7.0);
+        v["rope_parameters"] = serde_json::json!({"rope_theta":37.0});
+        assert_eq!(Config::parse(&v).unwrap().theta, 37.0);
+        v["rope_parameters"] = serde_json::Value::Null;
+        for theta in [0.0, -1.0, 1e100] {
+            v["rope_theta"] = serde_json::json!(theta);
+            assert!(Config::parse(&v).is_err());
         }
     }
 }
