@@ -32,6 +32,14 @@ alongside a real GPU is skipped automatically. Check what Vulkan sees with
 Validated on AMD RX 7900 XTX (gfx1100), RX 6900 XT (gfx1030), and NVIDIA GB10
 (Blackwell, aarch64).
 
+### Native LFM2.5 forward
+
+`vllm_vulkan._rs.Lfm2Model` runs LFM2 checkpoints, including LFM2.5-2.6B,
+with floating, MLX affine, GGML Q4/Q8, FP8 and NVFP4 weights through a
+standalone Vulkan forward engine. See
+[the LFM2 guide](docs/lfm2.md) for loading, generation, cache semantics and
+independent Transformers validation on the RX 560X.
+
 ### In a container
 
 **AMD (RADV).** Pass the render node and the device groups:

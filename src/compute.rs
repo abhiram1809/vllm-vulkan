@@ -768,6 +768,12 @@ impl ComputeEngine {
         )
     }
 
+    #[cfg(feature = "lfm2")]
+    pub(crate) fn storage_buffer_limit(&self) -> u64 {
+        unsafe { self.instance.get_physical_device_properties(self.physical_device) }
+            .limits.max_storage_buffer_range as u64
+    }
+
     /// Allocate a host-visible staging buffer.
     pub fn alloc_staging(&self, size: u64) -> Result<Buffer, String> {
         Buffer::staging(
